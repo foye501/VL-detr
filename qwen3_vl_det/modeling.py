@@ -181,6 +181,11 @@ class Qwen3VLDetrAdapter(nn.Module):
         if query_positions is not None:
             hidden = outputs.hidden_states[-1]
             query_states = self._gather_query_states(hidden_states=hidden, query_positions=query_positions)
+            # Keep detection heads numerically stable by running them in their own dtype.
+            # This avoids bf16/fp32 matmul mismatches when base model uses mixed precision.
+            head_dtype = self.obj_head.weight.dtype
+            if query_states.dtype != head_dtype:
+                query_states = query_states.to(head_dtype)
             obj_logits = self.obj_head(query_states).squeeze(-1)  # [B, Q]
             box_pred = torch.sigmoid(self.box_head(query_states))  # [B, Q, 4]
             result["det_obj_logits"] = obj_logits

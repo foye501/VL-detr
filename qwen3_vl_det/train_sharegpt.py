@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
+import transformers
 from datasets import load_dataset
 from torch.utils.data import DataLoader
 from transformers import AutoProcessor, AutoTokenizer
@@ -23,15 +24,20 @@ from transformers import AutoProcessor, AutoTokenizer
 from qwen3_vl_det.hungarian import HungarianLossConfig
 from qwen3_vl_det.modeling import AdapterLossConfig, Qwen3VLDetrAdapter
 
-try:
-    from transformers import Qwen2_5_VLProcessor
-except Exception:  # pragma: no cover
-    Qwen2_5_VLProcessor = None
+def _optional_transformers_class(*names: str):
+    for name in names:
+        try:
+            cls = getattr(transformers, name)
+            if cls is not None:
+                return cls
+        except Exception:
+            continue
+    return None
 
-try:
-    from transformers import Qwen2VLProcessor
-except Exception:  # pragma: no cover
-    Qwen2VLProcessor = None
+
+Qwen3VLProcessor = _optional_transformers_class("Qwen3VLProcessor", "Qwen3_VLProcessor")
+Qwen2_5_VLProcessor = _optional_transformers_class("Qwen2_5_VLProcessor")
+Qwen2VLProcessor = _optional_transformers_class("Qwen2VLProcessor")
 
 DET_QUERY_TOKEN = "<|det_query|>"
 BOX_PATTERN = re.compile(
@@ -286,6 +292,13 @@ class TokenizerOnlyProcessor:
 
 def load_processor(model_name: str, tokenizer):
     errors = []
+    if Qwen3VLProcessor is not None:
+        try:
+            p = Qwen3VLProcessor.from_pretrained(model_name, trust_remote_code=True)
+            p.tokenizer = tokenizer
+            return p, True
+        except Exception as e:
+            errors.append(f"Qwen3VLProcessor: {type(e).__name__}: {e}")
     if Qwen2_5_VLProcessor is not None:
         try:
             p = Qwen2_5_VLProcessor.from_pretrained(model_name, trust_remote_code=True)

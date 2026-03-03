@@ -7,6 +7,7 @@ from typing import Any, Optional
 
 import torch
 import torch.nn as nn
+import transformers
 from transformers import AutoModelForCausalLM
 
 try:
@@ -19,15 +20,23 @@ try:
 except Exception:  # pragma: no cover - optional in some transformers versions
     AutoModelForVision2Seq = None
 
-try:
-    from transformers import Qwen2_5_VLForConditionalGeneration
-except Exception:  # pragma: no cover - optional in some transformers versions
-    Qwen2_5_VLForConditionalGeneration = None
+def _optional_transformers_class(*names: str):
+    for name in names:
+        try:
+            cls = getattr(transformers, name)
+            if cls is not None:
+                return cls
+        except Exception:
+            continue
+    return None
 
-try:
-    from transformers import Qwen2VLForConditionalGeneration
-except Exception:  # pragma: no cover - optional in some transformers versions
-    Qwen2VLForConditionalGeneration = None
+
+Qwen3VLForConditionalGeneration = _optional_transformers_class(
+    "Qwen3VLForConditionalGeneration",
+    "Qwen3_VLForConditionalGeneration",
+)
+Qwen2_5_VLForConditionalGeneration = _optional_transformers_class("Qwen2_5_VLForConditionalGeneration")
+Qwen2VLForConditionalGeneration = _optional_transformers_class("Qwen2VLForConditionalGeneration")
 
 from .hungarian import HungarianLossConfig, detr_hungarian_loss
 
@@ -78,6 +87,8 @@ class Qwen3VLDetrAdapter(nn.Module):
           - If your current code already loads the model, pass it to __init__ directly.
         """
         loaders = []
+        if Qwen3VLForConditionalGeneration is not None:
+            loaders.append(Qwen3VLForConditionalGeneration)
         if Qwen2_5_VLForConditionalGeneration is not None:
             loaders.append(Qwen2_5_VLForConditionalGeneration)
         if Qwen2VLForConditionalGeneration is not None:

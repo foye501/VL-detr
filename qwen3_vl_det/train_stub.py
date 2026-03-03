@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
-from transformers import AutoProcessor, AutoTokenizer
+from transformers import AutoTokenizer
 
 from qwen3_vl_det.hungarian import HungarianLossConfig
 from qwen3_vl_det.modeling import AdapterLossConfig, Qwen3VLDetrAdapter
@@ -39,7 +39,7 @@ def find_query_positions(input_ids: torch.Tensor, query_token_id: int, num_queri
     return out
 
 
-def fake_batch(tokenizer, processor, num_queries: int, device: str) -> dict[str, Any]:
+def fake_batch(tokenizer, num_queries: int, device: str) -> dict[str, Any]:
     """Toy batch for wiring check only.
 
     Replace this with your real collator that returns:
@@ -62,14 +62,12 @@ def fake_batch(tokenizer, processor, num_queries: int, device: str) -> dict[str,
         "query_positions": query_positions,
         "gt_boxes": gt_boxes,
     }
-    _ = processor  # kept to show where processor belongs in your real pipeline.
     return batch
 
 
 def main() -> None:
     cfg = TrainConfig()
     tokenizer = AutoTokenizer.from_pretrained(cfg.model_name, trust_remote_code=True)
-    processor = AutoProcessor.from_pretrained(cfg.model_name, trust_remote_code=True)
 
     # Add a query marker token; you can also reserve multiple query tokens if preferred.
     special_tokens = {"additional_special_tokens": ["<|det_query|>"]}
@@ -96,7 +94,7 @@ def main() -> None:
 
     # Replace this loop with your real dataloader.
     for step in range(5):
-        batch = fake_batch(tokenizer, processor, num_queries=cfg.num_queries, device=cfg.device)
+        batch = fake_batch(tokenizer, num_queries=cfg.num_queries, device=cfg.device)
         out = model(
             input_ids=batch["input_ids"],
             attention_mask=batch["attention_mask"],

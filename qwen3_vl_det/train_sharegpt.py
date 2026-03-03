@@ -127,25 +127,59 @@ def _as_messages(example: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _extract_user_assistant(messages: list[dict[str, Any]]) -> tuple[str, str]:
-    user_text = ""
-    assistant_text = ""
-    for m in messages:
-        role = (m.get("from") or m.get("role") or "").lower()
-        value = m.get("value", m.get("content", ""))
+    def _to_text(value: Any) -> str:
         if isinstance(value, list):
             # Some schemas store content as typed chunks.
             chunks = []
             for c in value:
                 if isinstance(c, dict):
                     if c.get("type") == "text":
-                        chunks.append(c.get("text", ""))
+                        chunks.append(str(c.get("text", "")))
                 elif isinstance(c, str):
                     chunks.append(c)
-            value = "\n".join(chunks)
+            return "\n".join(chunks)
+        return str(value)
+
+    parsed: list[tuple[str, str]] = []
+    for m in messages:
+        role = (m.get("from") or m.get("role") or "").lower()
+        text = _to_text(m.get("value", m.get("content", "")))
+        parsed.append((role, text))
+
+    # Prefer assistant turn that actually contains <box> annotations and pair it
+    # with the closest preceding user turn to avoid multi-turn misalignment.
+    assistant_candidates: list[tuple[int, str, int]] = []
+    for i, (role, text) in enumerate(parsed):
+        if role in ("gpt", "assistant"):
+            num_boxes = len(BOX_PATTERN.findall(text))
+            if num_boxes > 0:
+                assistant_candidates.append((i, text, num_boxes))
+
+    if assistant_candidates:
+        best_i, assistant_text, _ = max(assistant_candidates, key=lambda x: x[2])
+        user_text = ""
+        for j in range(best_i - 1, -1, -1):
+            role, text = parsed[j]
+            if role in ("human", "user"):
+                user_text = text
+                break
+        if not user_text:
+            # Fallback: use latest user turn if no preceding one is found.
+            for role, text in reversed(parsed):
+                if role in ("human", "user"):
+                    user_text = text
+                    break
+        if user_text:
+            return user_text, assistant_text
+
+    # Fallback for datasets without explicit <box> annotations in assistant text.
+    user_text = ""
+    assistant_text = ""
+    for role, text in parsed:
         if role in ("human", "user"):
-            user_text = str(value)
+            user_text = text
         elif role in ("gpt", "assistant"):
-            assistant_text = str(value)
+            assistant_text = text
     if not user_text or not assistant_text:
         raise ValueError("Could not extract user/assistant turns from sample.")
     return user_text, assistant_text

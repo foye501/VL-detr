@@ -1,0 +1,143 @@
+"""Qwen3-VL wrapper with DETR-style query-slot head."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Optional
+
+import torch
+import torch.nn as nn
+from transformers import AutoModelForCausalLM
+
+from .hungarian import HungarianLossConfig, detr_hungarian_loss
+
+
+@dataclass
+class AdapterLossConfig:
+    lm_weight: float = 1.0
+    det_weight: float = 1.0
+
+
+class Qwen3VLDetrAdapter(nn.Module):
+    """Add fixed query slots + Hungarian box loss on top of a language model.
+
+    Expected batch fields:
+      - query_positions: LongTensor [B, Q], token positions of query markers.
+      - gt_boxes: list[Tensor [Gi, 4]] in normalized cxcywh format.
+    """
+
+    def __init__(
+        self,
+        base_model: nn.Module,
+        hidden_size: int,
+        num_queries: int = 16,
+        hungarian_cfg: Optional[HungarianLossConfig] = None,
+        loss_cfg: Optional[AdapterLossConfig] = None,
+    ) -> None:
+        super().__init__()
+        self.base_model = base_model
+        self.hidden_size = hidden_size
+        self.num_queries = num_queries
+        self.obj_head = nn.Linear(hidden_size, 1)
+        self.box_head = nn.Linear(hidden_size, 4)
+        self.hungarian_cfg = hungarian_cfg or HungarianLossConfig()
+        self.loss_cfg = loss_cfg or AdapterLossConfig()
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        model_name_or_path: str,
+        num_queries: int = 16,
+        trust_remote_code: bool = True,
+        **kwargs: Any,
+    ) -> "Qwen3VLDetrAdapter":
+        """Load a causal LM and attach DETR-style heads.
+
+        Notes:
+          - For some Qwen3-VL checkpoints you may need a different AutoModel class.
+          - If your current code already loads the model, pass it to __init__ directly.
+        """
+        base = AutoModelForCausalLM.from_pretrained(
+            model_name_or_path,
+            trust_remote_code=trust_remote_code,
+            **kwargs,
+        )
+        hidden_size = int(base.config.hidden_size)
+        return cls(base_model=base, hidden_size=hidden_size, num_queries=num_queries)
+
+    def _gather_query_states(
+        self,
+        hidden_states: torch.Tensor,
+        query_positions: torch.Tensor,
+    ) -> torch.Tensor:
+        # hidden_states: [B, T, H], query_positions: [B, Q]
+        if query_positions.dim() != 2:
+            raise ValueError("query_positions must be [B, Q].")
+        if query_positions.shape[1] != self.num_queries:
+            raise ValueError(
+                f"query_positions second dim ({query_positions.shape[1]}) "
+                f"must equal num_queries ({self.num_queries})."
+            )
+        bsz, _, hidden = hidden_states.shape
+        if hidden != self.hidden_size:
+            raise ValueError(f"Hidden size mismatch: got {hidden}, expected {self.hidden_size}")
+        gather_idx = query_positions.unsqueeze(-1).expand(bsz, self.num_queries, hidden)
+        return hidden_states.gather(dim=1, index=gather_idx)
+
+    def forward(
+        self,
+        query_positions: Optional[torch.Tensor] = None,
+        gt_boxes: Optional[list[torch.Tensor]] = None,
+        **base_inputs: Any,
+    ) -> dict[str, Any]:
+        """Forward pass.
+
+        Args:
+          query_positions: [B, Q] token positions for query slots.
+          gt_boxes: list of length B, each [Gi,4] normalized cxcywh.
+          **base_inputs: forwarded to base model (input_ids, labels, pixel_values, ...).
+        """
+        outputs = self.base_model(
+            output_hidden_states=True,
+            return_dict=True,
+            **base_inputs,
+        )
+
+        result: dict[str, Any] = {
+            "base_outputs": outputs,
+            "logits": outputs.logits,
+        }
+        lm_loss = getattr(outputs, "loss", None)
+        if lm_loss is not None:
+            result["lm_loss"] = lm_loss
+
+        det_loss = None
+        if query_positions is not None:
+            hidden = outputs.hidden_states[-1]
+            query_states = self._gather_query_states(hidden_states=hidden, query_positions=query_positions)
+            obj_logits = self.obj_head(query_states).squeeze(-1)  # [B, Q]
+            box_pred = torch.sigmoid(self.box_head(query_states))  # [B, Q, 4]
+            result["det_obj_logits"] = obj_logits
+            result["det_boxes"] = box_pred
+
+            if gt_boxes is not None:
+                det_loss, det_stats = detr_hungarian_loss(
+                    pred_obj_logits=obj_logits,
+                    pred_boxes=box_pred,
+                    gt_boxes=gt_boxes,
+                    cfg=self.hungarian_cfg,
+                )
+                result["det_loss"] = det_loss
+                result["det_stats"] = det_stats
+
+        total_loss = None
+        if lm_loss is not None and det_loss is not None:
+            total_loss = self.loss_cfg.lm_weight * lm_loss + self.loss_cfg.det_weight * det_loss
+        elif lm_loss is not None:
+            total_loss = lm_loss
+        elif det_loss is not None:
+            total_loss = det_loss
+
+        if total_loss is not None:
+            result["loss"] = total_loss
+        return result

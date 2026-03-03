@@ -1,0 +1,31 @@
+.DS_Store
+
+# LaTeX build artifacts
+*.aux
+*.bbl
+*.bcf
+*.blg
+*.fdb_latexmk
+*.fls
+*.log
+*.nav
+*.out
+*.run.xml
+*.snm
+*.synctex.gz
+*.toc
+*.vrb
+*.lof
+*.lot
+
+# Optional local build folder
+build/
+
+# Python
+__pycache__/
+*.pyc
+
+# Toy DETR generated outputs
+detr_toy/artifacts*/
+detr_toy/.cache/
+detr_toy/.mplconfig/

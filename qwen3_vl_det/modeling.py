@@ -9,6 +9,26 @@ import torch
 import torch.nn as nn
 from transformers import AutoModelForCausalLM
 
+try:
+    from transformers import AutoModelForImageTextToText
+except Exception:  # pragma: no cover - optional in some transformers versions
+    AutoModelForImageTextToText = None
+
+try:
+    from transformers import AutoModelForVision2Seq
+except Exception:  # pragma: no cover - optional in some transformers versions
+    AutoModelForVision2Seq = None
+
+try:
+    from transformers import Qwen2_5_VLForConditionalGeneration
+except Exception:  # pragma: no cover - optional in some transformers versions
+    Qwen2_5_VLForConditionalGeneration = None
+
+try:
+    from transformers import Qwen2VLForConditionalGeneration
+except Exception:  # pragma: no cover - optional in some transformers versions
+    Qwen2VLForConditionalGeneration = None
+
 from .hungarian import HungarianLossConfig, detr_hungarian_loss
 
 
@@ -57,13 +77,54 @@ class Qwen3VLDetrAdapter(nn.Module):
           - For some Qwen3-VL checkpoints you may need a different AutoModel class.
           - If your current code already loads the model, pass it to __init__ directly.
         """
-        base = AutoModelForCausalLM.from_pretrained(
-            model_name_or_path,
-            trust_remote_code=trust_remote_code,
-            **kwargs,
-        )
-        hidden_size = int(base.config.hidden_size)
+        loaders = []
+        if Qwen2_5_VLForConditionalGeneration is not None:
+            loaders.append(Qwen2_5_VLForConditionalGeneration)
+        if Qwen2VLForConditionalGeneration is not None:
+            loaders.append(Qwen2VLForConditionalGeneration)
+        if AutoModelForImageTextToText is not None:
+            loaders.append(AutoModelForImageTextToText)
+        if AutoModelForVision2Seq is not None:
+            loaders.append(AutoModelForVision2Seq)
+        loaders.append(AutoModelForCausalLM)
+
+        base = None
+        load_errors: list[str] = []
+        for loader in loaders:
+            try:
+                base = loader.from_pretrained(
+                    model_name_or_path,
+                    trust_remote_code=trust_remote_code,
+                    **kwargs,
+                )
+                break
+            except Exception as exc:  # pragma: no cover - depends on runtime env/model
+                load_errors.append(f"{loader.__name__}: {exc}")
+
+        if base is None:
+            raise ValueError(
+                "Could not load model with any supported loader. Errors:\n"
+                + "\n".join(load_errors)
+            )
+
+        hidden_size = cls._extract_hidden_size(base.config)
         return cls(base_model=base, hidden_size=hidden_size, num_queries=num_queries)
+
+    @staticmethod
+    def _extract_hidden_size(config: Any) -> int:
+        for key in ("hidden_size", "d_model"):
+            if hasattr(config, key):
+                return int(getattr(config, key))
+
+        for sub_name in ("text_config", "language_config", "llm_config"):
+            sub_cfg = getattr(config, sub_name, None)
+            if sub_cfg is None:
+                continue
+            for key in ("hidden_size", "d_model"):
+                if hasattr(sub_cfg, key):
+                    return int(getattr(sub_cfg, key))
+
+        raise ValueError("Unable to infer hidden size from model config.")
 
     def _gather_query_states(
         self,
@@ -105,8 +166,13 @@ class Qwen3VLDetrAdapter(nn.Module):
 
         result: dict[str, Any] = {
             "base_outputs": outputs,
-            "logits": outputs.logits,
         }
+        if not hasattr(outputs, "logits"):
+            raise ValueError(
+                "Base model output has no `logits`. Use a conditional-generation "
+                "Qwen2.5-VL model class."
+            )
+        result["logits"] = outputs.logits
         lm_loss = getattr(outputs, "loss", None)
         if lm_loss is not None:
             result["lm_loss"] = lm_loss

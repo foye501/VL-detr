@@ -77,7 +77,7 @@ def main() -> None:
         cfg.model_name,
         num_queries=cfg.num_queries,
         trust_remote_code=True,
-        torch_dtype=torch.bfloat16 if cfg.device.startswith("cuda") else torch.float32,
+        dtype=torch.bfloat16 if cfg.device.startswith("cuda") else torch.float32,
     )
     model.base_model.resize_token_embeddings(len(tokenizer))
     model.hungarian_cfg = HungarianLossConfig(

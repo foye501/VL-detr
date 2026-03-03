@@ -28,6 +28,11 @@ try:
 except Exception:  # pragma: no cover
     Qwen2_5_VLProcessor = None
 
+try:
+    from transformers import Qwen2VLProcessor
+except Exception:  # pragma: no cover
+    Qwen2VLProcessor = None
+
 DET_QUERY_TOKEN = "<|det_query|>"
 BOX_PATTERN = re.compile(
     r"<box>\s*\[\s*([-+]?\d*\.?\d+)\s*,\s*([-+]?\d*\.?\d+)\s*,\s*([-+]?\d*\.?\d+)\s*,\s*([-+]?\d*\.?\d+)\s*\]\s*</box>",
@@ -166,10 +171,11 @@ def find_query_positions(input_ids: torch.Tensor, query_token_id: int, num_queri
 
 
 class ShareGptCollator:
-    def __init__(self, processor, num_queries: int, max_length: int) -> None:
+    def __init__(self, processor, num_queries: int, max_length: int, use_vision: bool) -> None:
         self.processor = processor
         self.num_queries = num_queries
         self.max_length = max_length
+        self.use_vision = use_vision
         self.query_token_id = int(processor.tokenizer.convert_tokens_to_ids(DET_QUERY_TOKEN))
         if self.query_token_id < 0:
             raise ValueError(f"{DET_QUERY_TOKEN} token id not found in tokenizer.")
@@ -212,14 +218,23 @@ class ShareGptCollator:
             images.append(img)
             gt_boxes.append(parse_boxes_from_text(assistant_text, width=width, height=height))
 
-        inputs = self.processor(
-            text=texts,
-            images=images,
-            padding=True,
-            truncation=True,
-            max_length=self.max_length,
-            return_tensors="pt",
-        )
+        if self.use_vision:
+            inputs = self.processor(
+                text=texts,
+                images=images,
+                padding=True,
+                truncation=True,
+                max_length=self.max_length,
+                return_tensors="pt",
+            )
+        else:
+            inputs = self.processor(
+                text=texts,
+                padding=True,
+                truncation=True,
+                max_length=self.max_length,
+                return_tensors="pt",
+            )
         input_ids = inputs["input_ids"]
         labels = input_ids.clone()
         if "attention_mask" in inputs:
@@ -251,13 +266,50 @@ def to_device(batch: dict[str, Any], device: str) -> dict[str, Any]:
     return moved
 
 
-def load_processor(model_name: str):
+class TokenizerOnlyProcessor:
+    """Fallback when multimodal processor fails in current transformers build."""
+
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
+
+    def apply_chat_template(self, *args, **kwargs):
+        return self.tokenizer.apply_chat_template(*args, **kwargs)
+
+    def __call__(self, text, **kwargs):
+        # Drop image/video kwargs in tokenizer-only fallback.
+        kwargs.pop("images", None)
+        kwargs.pop("videos", None)
+        return self.tokenizer(text, **kwargs)
+
+
+def load_processor(model_name: str, tokenizer):
+    errors = []
     if Qwen2_5_VLProcessor is not None:
         try:
-            return Qwen2_5_VLProcessor.from_pretrained(model_name, trust_remote_code=True)
-        except Exception:
-            pass
-    return AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
+            p = Qwen2_5_VLProcessor.from_pretrained(model_name, trust_remote_code=True)
+            p.tokenizer = tokenizer
+            return p, True
+        except Exception as e:
+            errors.append(f"Qwen2_5_VLProcessor: {type(e).__name__}: {e}")
+    if Qwen2VLProcessor is not None:
+        try:
+            p = Qwen2VLProcessor.from_pretrained(model_name, trust_remote_code=True)
+            p.tokenizer = tokenizer
+            return p, True
+        except Exception as e:
+            errors.append(f"Qwen2VLProcessor: {type(e).__name__}: {e}")
+    try:
+        p = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
+        p.tokenizer = tokenizer
+        return p, True
+    except Exception as e:
+        errors.append(f"AutoProcessor: {type(e).__name__}: {e}")
+
+    print("WARNING: Could not load VL processor; falling back to tokenizer-only mode.")
+    for err in errors:
+        print("  -", err)
+    print("Training will run, but vision tensors are disabled in this fallback.")
+    return TokenizerOnlyProcessor(tokenizer), False
 
 
 def main() -> None:
@@ -273,8 +325,7 @@ def main() -> None:
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True)
     tokenizer.add_special_tokens({"additional_special_tokens": [DET_QUERY_TOKEN]})
-    processor = load_processor(args.model_name)
-    processor.tokenizer = tokenizer
+    processor, use_vision = load_processor(args.model_name, tokenizer)
 
     model = Qwen3VLDetrAdapter.from_pretrained(
         args.model_name,
@@ -303,6 +354,7 @@ def main() -> None:
         processor=processor,
         num_queries=args.num_queries,
         max_length=args.max_length,
+        use_vision=use_vision,
     )
     loader = DataLoader(
         ds,

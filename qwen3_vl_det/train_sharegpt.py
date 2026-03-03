@@ -58,6 +58,7 @@ class TrainArgs:
     lm_weight: float = 1.0
     det_weight: float = 0.7
     train_heads_only: bool = False
+    require_vision: bool = False
     seed: int = 7
     hf_token: str = ""
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -81,6 +82,7 @@ def parse_args() -> TrainArgs:
     p.add_argument("--lm-weight", type=float, default=TrainArgs.lm_weight)
     p.add_argument("--det-weight", type=float, default=TrainArgs.det_weight)
     p.add_argument("--train-heads-only", action="store_true")
+    p.add_argument("--require-vision", action="store_true")
     p.add_argument("--seed", type=int, default=TrainArgs.seed)
     p.add_argument("--hf-token", default=TrainArgs.hf_token)
     p.add_argument("--device", default=TrainArgs.device)
@@ -326,6 +328,11 @@ def main() -> None:
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True)
     tokenizer.add_special_tokens({"additional_special_tokens": [DET_QUERY_TOKEN]})
     processor, use_vision = load_processor(args.model_name, tokenizer)
+    if args.require_vision and not use_vision:
+        raise RuntimeError(
+            "Vision processor failed to load. Install compatible vision deps (e.g., torchvision) "
+            "or adjust transformers version, then rerun."
+        )
 
     model = Qwen3VLDetrAdapter.from_pretrained(
         args.model_name,
@@ -410,6 +417,11 @@ def main() -> None:
     os.makedirs(ckpt_dir, exist_ok=True)
     model.base_model.save_pretrained(ckpt_dir)
     tokenizer.save_pretrained(ckpt_dir)
+    if use_vision:
+        try:
+            processor.save_pretrained(ckpt_dir)
+        except Exception as e:
+            print(f"WARNING: failed to save processor: {type(e).__name__}: {e}")
     torch.save(
         {
             "adapter_state_dict": model.state_dict(),

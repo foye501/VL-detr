@@ -50,6 +50,7 @@ For dataset `foye501/VLM-Counting-dataset-qwenvl-sharegpt`, run:
 python -m qwen3_vl_det.train_sharegpt \
   --dataset-name foye501/VLM-Counting-dataset-qwenvl-sharegpt \
   --train-split train \
+  --require-vision \
   --model-name Qwen/Qwen2.5-VL-3B-Instruct \
   --num-queries 32 \
   --batch-size 1 \
@@ -67,6 +68,7 @@ Quick smoke run:
 ```bash
 python -m qwen3_vl_det.train_sharegpt \
   --dataset-name foye501/VLM-Counting-dataset-qwenvl-sharegpt \
+  --require-vision \
   --max-samples 32 \
   --max-steps 20 \
   --num-queries 16 \
@@ -91,6 +93,7 @@ python -m qwen3_vl_det.eval_one \
   --dataset-name foye501/VLM-Counting-dataset-qwenvl-sharegpt \
   --sample-index 0 \
   --num-queries 32 \
+  --require-vision \
   --obj-threshold 0.5 \
   --output-image qwen3_vl_det/eval_sample0.png
 ```
@@ -98,6 +101,9 @@ python -m qwen3_vl_det.eval_one \
 Output image:
 - green boxes = GT
 - red boxes = prediction
+
+If you see `vision tensors are disabled in this fallback`, do not trust the result.
+Install vision dependencies and force strict mode with `--require-vision`.
 
 ## Why This Helps Your Paper
 

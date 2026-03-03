@@ -82,6 +82,11 @@ def main() -> None:
     w, h = img.size
 
     ckpt_dir = args.checkpoint_dir
+    train_args_path = os.path.join(ckpt_dir, "train_args.json")
+    train_args: dict[str, Any] = {}
+    if os.path.exists(train_args_path):
+        with open(train_args_path, "r", encoding="utf-8") as f:
+            train_args = json.load(f)
     tokenizer_path = ckpt_dir if os.path.exists(os.path.join(ckpt_dir, "tokenizer_config.json")) else args.model_name
     if not tokenizer_path:
         raise ValueError("Tokenizer not found in checkpoint; provide --model-name.")
@@ -90,10 +95,19 @@ def main() -> None:
     if tokenizer.convert_tokens_to_ids(DET_QUERY_TOKEN) < 0:
         tokenizer.add_special_tokens({"additional_special_tokens": [DET_QUERY_TOKEN]})
 
-    processor_model = args.model_name if args.model_name else ckpt_dir
+    if args.model_name:
+        processor_model = args.model_name
+    elif os.path.exists(os.path.join(ckpt_dir, "preprocessor_config.json")):
+        processor_model = ckpt_dir
+    elif "model_name" in train_args and train_args["model_name"]:
+        processor_model = str(train_args["model_name"])
+    else:
+        processor_model = ckpt_dir
     processor, use_vision = load_processor(processor_model, tokenizer)
     if args.require_vision and not use_vision:
         raise RuntimeError("Vision processor unavailable. Install compatible transformers/torchvision and rerun.")
+    if not use_vision:
+        print("WARNING: running without vision tensors; predictions are not valid for real detection quality.")
 
     model = Qwen3VLDetrAdapter.from_pretrained(
         ckpt_dir,

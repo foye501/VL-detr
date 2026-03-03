@@ -105,6 +105,45 @@ Output image:
 If you see `vision tensors are disabled in this fallback`, do not trust the result.
 Install vision dependencies and force strict mode with `--require-vision`.
 
+## Split Evaluation (ShareGPT Dataset)
+
+```bash
+python -m qwen3_vl_det.eval_split \
+  --checkpoint-dir qwen3_vl_det/checkpoints_run2/last \
+  --dataset-name foye501/VLM-Counting-dataset-qwenvl-sharegpt \
+  --split train \
+  --start-index 9000 \
+  --max-samples 500 \
+  --num-queries 32 \
+  --obj-threshold 0.5 \
+  --iou-threshold 0.5 \
+  --require-vision \
+  --output-json qwen3_vl_det/eval_sharegpt_run2.json \
+  --save-overlays \
+  --overlay-dir qwen3_vl_det/eval_sharegpt_overlays
+```
+
+## Real Data Check (COCO Subset)
+
+Requires local COCO files (`instances_val2017.json` + `val2017/` images):
+
+```bash
+python -m qwen3_vl_det.eval_coco_subset \
+  --checkpoint-dir qwen3_vl_det/checkpoints_run2/last \
+  --model-name Qwen/Qwen3-VL-2B-Instruct \
+  --coco-ann /data/coco/annotations/instances_val2017.json \
+  --coco-img-dir /data/coco/val2017 \
+  --category person \
+  --max-images 200 \
+  --num-queries 32 \
+  --obj-threshold 0.5 \
+  --iou-threshold 0.5 \
+  --require-vision \
+  --output-json qwen3_vl_det/eval_coco_person.json \
+  --save-overlays \
+  --overlay-dir qwen3_vl_det/eval_coco_overlays
+```
+
 ## Why This Helps Your Paper
 
 - Forces one-to-one instance assignment (reduces duplicate counting).

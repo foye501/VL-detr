@@ -19,6 +19,7 @@ from qwen3_vl_det.train_sharegpt import (
     _extract_image,
     _extract_user_assistant,
     _infer_box_coord_mode,
+    _infer_box_coord_order,
     extract_boxes_raw,
 )
 
@@ -41,6 +42,7 @@ def main() -> None:
     end = min(len(ds), start + args.max_samples)
 
     mode_counter = Counter()
+    order_counter = Counter()
     total_boxes = 0
     over_dim_boxes = 0
     max_coords = []
@@ -53,7 +55,9 @@ def main() -> None:
         w, h = img.size
         raw_boxes = extract_boxes_raw(assistant)
         mode = _infer_box_coord_mode(raw_boxes, width=w, height=h)
+        order = _infer_box_coord_order(raw_boxes, width=w, height=h, mode=mode)
         mode_counter[mode] += 1
+        order_counter[order] += 1
         for b in raw_boxes:
             total_boxes += 1
             m = max(b)
@@ -66,6 +70,7 @@ def main() -> None:
 
     print(f"inspected_samples={end-start}")
     print("inferred_mode_counts:", dict(mode_counter))
+    print("inferred_order_counts:", dict(order_counter))
     print(f"total_boxes={total_boxes}")
     if total_boxes > 0:
         print(f"boxes_with_coord_gt_image_dim={over_dim_boxes} ({over_dim_boxes/total_boxes:.2%})")
@@ -77,6 +82,9 @@ def main() -> None:
     if mode_counter:
         suggested = mode_counter.most_common(1)[0][0]
         print(f"suggested_box_coord_mode={suggested}")
+    if order_counter:
+        suggested_order = order_counter.most_common(1)[0][0]
+        print(f"suggested_box_coord_order={suggested_order}")
 
 
 if __name__ == "__main__":

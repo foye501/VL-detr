@@ -27,6 +27,7 @@ from qwen3_vl_det.train_sharegpt import (
     _extract_image,
     _extract_user_assistant,
     find_query_positions,
+    _infer_box_coord_order,
     load_processor,
     _infer_box_coord_mode,
     extract_boxes_raw,
@@ -43,6 +44,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num-queries", type=int, default=32)
     p.add_argument("--obj-threshold", type=float, default=0.5)
     p.add_argument("--box-coord-mode", choices=["auto", "absolute", "norm1000", "norm01"], default="auto")
+    p.add_argument("--box-coord-order", choices=["auto", "xyxy", "yxyx"], default="auto")
     p.add_argument("--model-name", default="")
     p.add_argument("--hf-token", default="")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -182,8 +184,16 @@ def main() -> None:
 
     raw_boxes = extract_boxes_raw(assistant_text)
     inferred_mode = _infer_box_coord_mode(raw_boxes, width=w, height=h)
+    inferred_order = _infer_box_coord_order(raw_boxes, width=w, height=h, mode=inferred_mode)
     used_mode = inferred_mode if args.box_coord_mode == "auto" else args.box_coord_mode
-    gt_boxes = parse_boxes_from_text(assistant_text, width=w, height=h, coord_mode=args.box_coord_mode)
+    used_order = inferred_order if args.box_coord_order == "auto" else args.box_coord_order
+    gt_boxes = parse_boxes_from_text(
+        assistant_text,
+        width=w,
+        height=h,
+        coord_mode=args.box_coord_mode,
+        coord_order=args.box_coord_order,
+    )
     gt_xyxy = cxcywh_to_xyxy_abs(gt_boxes, width=w, height=h)
 
     vis = img.copy()
@@ -196,6 +206,7 @@ def main() -> None:
     print(f"Pred count (@{args.obj_threshold:.2f}): {pred_boxes.shape[0]}")
     print(f"Image size: {w}x{h}")
     print(f"Box coord mode: requested={args.box_coord_mode}, inferred={inferred_mode}, used={used_mode}")
+    print(f"Box coord order: requested={args.box_coord_order}, inferred={inferred_order}, used={used_order}")
     if gt_boxes.numel() > 0:
         print(
             "GT box stats (norm cxcywh):",

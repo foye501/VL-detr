@@ -73,6 +73,7 @@ class TrainArgs:
     train_heads_only: bool = False
     require_vision: bool = False
     box_coord_mode: str = "auto"  # auto | absolute | norm1000 | norm01
+    box_coord_order: str = "auto"  # auto | xyxy | yxyx
     seed: int = 7
     hf_token: str = ""
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -108,6 +109,11 @@ def parse_args() -> TrainArgs:
         "--box-coord-mode",
         choices=["auto", "absolute", "norm1000", "norm01"],
         default=TrainArgs.box_coord_mode,
+    )
+    p.add_argument(
+        "--box-coord-order",
+        choices=["auto", "xyxy", "yxyx"],
+        default=TrainArgs.box_coord_order,
     )
     p.add_argument("--seed", type=int, default=TrainArgs.seed)
     p.add_argument("--hf-token", default=TrainArgs.hf_token)
@@ -228,8 +234,12 @@ def _convert_raw_box_to_pixels(
     width: int,
     height: int,
     mode: str,
+    order: str,
 ) -> tuple[float, float, float, float]:
-    x1, y1, x2, y2 = box
+    if order == "yxyx":
+        y1, x1, y2, x2 = box
+    else:
+        x1, y1, x2, y2 = box
     if mode == "norm1000":
         x1, x2 = x1 / 1000.0 * width, x2 / 1000.0 * width
         y1, y2 = y1 / 1000.0 * height, y2 / 1000.0 * height
@@ -240,17 +250,76 @@ def _convert_raw_box_to_pixels(
     return x1, y1, x2, y2
 
 
+def _coord_order_score(
+    raw_boxes: list[list[float]],
+    width: int,
+    height: int,
+    mode: str,
+    order: str,
+) -> tuple[float, int]:
+    score = 0.0
+    valid = 0
+    for raw in raw_boxes:
+        x1, y1, x2, y2 = _convert_raw_box_to_pixels(
+            raw,
+            width=width,
+            height=height,
+            mode=mode,
+            order=order,
+        )
+        w = x2 - x1
+        h = y2 - y1
+        if w <= 0 or h <= 0:
+            continue
+        valid += 1
+        in_bounds = (
+            0.0 <= x1 <= float(width)
+            and 0.0 <= x2 <= float(width)
+            and 0.0 <= y1 <= float(height)
+            and 0.0 <= y2 <= float(height)
+        )
+        score += 2.0 if in_bounds else 1.0
+        area = (w * h) / max(float(width * height), 1.0)
+        if 1e-5 <= area <= 0.8:
+            score += 0.5
+    return score, valid
+
+
+def _infer_box_coord_order(raw_boxes: list[list[float]], width: int, height: int, mode: str) -> str:
+    if not raw_boxes:
+        return "xyxy"
+    xy_score, xy_valid = _coord_order_score(raw_boxes, width, height, mode, "xyxy")
+    yx_score, yx_valid = _coord_order_score(raw_boxes, width, height, mode, "yxyx")
+    if yx_valid > xy_valid:
+        return "yxyx"
+    if xy_valid > yx_valid:
+        return "xyxy"
+    return "yxyx" if yx_score > xy_score else "xyxy"
+
+
 def parse_boxes_from_text(
     text: str,
     width: int,
     height: int,
     coord_mode: str = "auto",
+    coord_order: str = "auto",
 ) -> torch.Tensor:
     raw_boxes = extract_boxes_raw(text)
     mode = _infer_box_coord_mode(raw_boxes, width=width, height=height) if coord_mode == "auto" else coord_mode
+    order = (
+        _infer_box_coord_order(raw_boxes, width=width, height=height, mode=mode)
+        if coord_order == "auto"
+        else coord_order
+    )
     boxes = []
     for raw in raw_boxes:
-        x1, y1, x2, y2 = _convert_raw_box_to_pixels(raw, width=width, height=height, mode=mode)
+        x1, y1, x2, y2 = _convert_raw_box_to_pixels(
+            raw,
+            width=width,
+            height=height,
+            mode=mode,
+            order=order,
+        )
         x1 = max(0.0, min(x1, float(width)))
         x2 = max(0.0, min(x2, float(width)))
         y1 = max(0.0, min(y1, float(height)))
@@ -289,12 +358,14 @@ class ShareGptCollator:
         max_length: int,
         use_vision: bool,
         box_coord_mode: str,
+        box_coord_order: str,
     ) -> None:
         self.processor = processor
         self.num_queries = num_queries
         self.max_length = max_length
         self.use_vision = use_vision
         self.box_coord_mode = box_coord_mode
+        self.box_coord_order = box_coord_order
         self.query_token_id = int(processor.tokenizer.convert_tokens_to_ids(DET_QUERY_TOKEN))
         if self.query_token_id < 0:
             raise ValueError(f"{DET_QUERY_TOKEN} token id not found in tokenizer.")
@@ -341,6 +412,7 @@ class ShareGptCollator:
                     width=width,
                     height=height,
                     coord_mode=self.box_coord_mode,
+                    coord_order=self.box_coord_order,
                 )
             )
 
@@ -496,6 +568,7 @@ def main() -> None:
         max_length=args.max_length,
         use_vision=use_vision,
         box_coord_mode=args.box_coord_mode,
+        box_coord_order=args.box_coord_order,
     )
     loader = DataLoader(
         ds,

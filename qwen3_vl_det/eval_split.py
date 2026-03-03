@@ -66,6 +66,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--obj-threshold", type=float, default=0.5)
     p.add_argument("--iou-threshold", type=float, default=0.5)
     p.add_argument("--box-coord-mode", choices=["auto", "absolute", "norm1000", "norm01"], default="auto")
+    p.add_argument("--box-coord-order", choices=["auto", "xyxy", "yxyx"], default="auto")
     p.add_argument("--easy-max", type=int, default=5)
     p.add_argument("--medium-max", type=int, default=20)
     p.add_argument("--hard-max", type=int, default=50)
@@ -294,6 +295,7 @@ def main() -> None:
             width=w,
             height=h,
             coord_mode=args.box_coord_mode,
+            coord_order=args.box_coord_order,
         )
         gt_xyxy = cxcywh_to_xyxy_abs(gt_boxes, width=w, height=h)
 
@@ -358,6 +360,7 @@ def main() -> None:
         "obj_threshold": args.obj_threshold,
         "iou_threshold": args.iou_threshold,
         "box_coord_mode": args.box_coord_mode,
+        "box_coord_order": args.box_coord_order,
         "bucket_thresholds": {
             "easy_max": args.easy_max,
             "medium_max": args.medium_max,

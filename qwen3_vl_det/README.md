@@ -63,6 +63,7 @@ python -m qwen3_vl_det.train_sharegpt \
   --lm-weight 1.0 \
   --det-weight 0.7 \
   --box-coord-mode auto \
+  --box-coord-order auto \
   --no-object-weight 0.5 \
   --count-loss-weight 0.5 \
   --obj-bias-init -2.0 \
@@ -100,6 +101,8 @@ python -m qwen3_vl_det.inspect_boxes \
 
 If it reports `suggested_box_coord_mode=norm1000`, train/eval with:
 - `--box-coord-mode norm1000`
+If it reports `suggested_box_coord_order=yxyx`, train/eval with:
+- `--box-coord-order yxyx`
 
 ## One-Sample Evaluation + Plot
 
@@ -113,6 +116,7 @@ python -m qwen3_vl_det.eval_one \
   --num-queries 32 \
   --require-vision \
   --box-coord-mode auto \
+  --box-coord-order auto \
   --obj-threshold 0.5 \
   --output-image qwen3_vl_det/eval_sample0.png
 ```
@@ -135,6 +139,7 @@ python -m qwen3_vl_det.eval_split \
   --max-samples 500 \
   --num-queries 32 \
   --box-coord-mode auto \
+  --box-coord-order auto \
   --obj-threshold 0.5 \
   --iou-threshold 0.5 \
   --easy-max 5 \

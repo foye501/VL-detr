@@ -137,11 +137,17 @@ python -m qwen3_vl_det.eval_split \
   --box-coord-mode auto \
   --obj-threshold 0.5 \
   --iou-threshold 0.5 \
+  --easy-max 5 \
+  --medium-max 20 \
+  --hard-max 50 \
   --require-vision \
   --output-json qwen3_vl_det/eval_sharegpt_run2.json \
   --save-overlays \
   --overlay-dir qwen3_vl_det/eval_sharegpt_overlays
 ```
+
+`eval_split` now reports both overall metrics and bucket metrics (`easy`, `medium`, `hard`, `extreme`)
+based on GT count ranges configured by the threshold flags above.
 
 ## Real Data Check (COCO Subset)
 

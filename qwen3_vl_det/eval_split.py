@@ -52,6 +52,7 @@ class EvalRow:
     precision: float
     recall: float
     f1: float
+    bucket: str
 
 
 def parse_args() -> argparse.Namespace:
@@ -65,6 +66,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--obj-threshold", type=float, default=0.5)
     p.add_argument("--iou-threshold", type=float, default=0.5)
     p.add_argument("--box-coord-mode", choices=["auto", "absolute", "norm1000", "norm01"], default="auto")
+    p.add_argument("--easy-max", type=int, default=5)
+    p.add_argument("--medium-max", type=int, default=20)
+    p.add_argument("--hard-max", type=int, default=50)
     p.add_argument("--model-name", default="")
     p.add_argument("--hf-token", default="")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -74,6 +78,39 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--overlay-every", type=int, default=50)
     p.add_argument("--output-json", default="qwen3_vl_det/eval_sharegpt.json")
     return p.parse_args()
+
+
+def bucket_from_gt_count(gt_count: int, easy_max: int, medium_max: int, hard_max: int) -> str:
+    if gt_count <= easy_max:
+        return "easy"
+    if gt_count <= medium_max:
+        return "medium"
+    if gt_count <= hard_max:
+        return "hard"
+    return "extreme"
+
+
+def aggregate_metrics(rows: list[EvalRow]) -> dict[str, float]:
+    if not rows:
+        return {
+            "count_mae": 0.0,
+            "count_accuracy": 0.0,
+            "precision": 0.0,
+            "recall": 0.0,
+            "f1": 0.0,
+        }
+    count_mae = sum(r.abs_error for r in rows) / len(rows)
+    count_acc = sum(1.0 for r in rows if r.abs_error == 0) / len(rows)
+    precision = sum(r.precision for r in rows) / len(rows)
+    recall = sum(r.recall for r in rows) / len(rows)
+    f1 = sum(r.f1 for r in rows) / len(rows)
+    return {
+        "count_mae": count_mae,
+        "count_accuracy": count_acc,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+    }
 
 
 def cxcywh_to_xyxy_abs(boxes: torch.Tensor, width: int, height: int) -> torch.Tensor:
@@ -178,6 +215,8 @@ def build_model_and_processor(args: argparse.Namespace):
 
 def main() -> None:
     args = parse_args()
+    if not (0 <= args.easy_max < args.medium_max < args.hard_max):
+        raise ValueError("Require thresholds: 0 <= easy-max < medium-max < hard-max.")
     os.makedirs(os.path.dirname(args.output_json) or ".", exist_ok=True)
     if args.save_overlays:
         os.makedirs(args.overlay_dir, exist_ok=True)
@@ -269,6 +308,12 @@ def main() -> None:
             precision=precision,
             recall=recall,
             f1=f1,
+            bucket=bucket_from_gt_count(
+                gt_count=gt_count,
+                easy_max=args.easy_max,
+                medium_max=args.medium_max,
+                hard_max=args.hard_max,
+            ),
         )
         rows.append(row)
 
@@ -286,11 +331,24 @@ def main() -> None:
     if not rows:
         raise RuntimeError("No samples evaluated.")
 
-    count_mae = sum(r.abs_error for r in rows) / len(rows)
-    count_acc = sum(1.0 for r in rows if r.abs_error == 0) / len(rows)
-    precision = sum(r.precision for r in rows) / len(rows)
-    recall = sum(r.recall for r in rows) / len(rows)
-    f1 = sum(r.f1 for r in rows) / len(rows)
+    metrics = aggregate_metrics(rows)
+
+    bucket_ranges = {
+        "easy": f"<= {args.easy_max}",
+        "medium": f"{args.easy_max + 1}-{args.medium_max}",
+        "hard": f"{args.medium_max + 1}-{args.hard_max}",
+        "extreme": f">= {args.hard_max + 1}",
+    }
+    bucket_order = ("easy", "medium", "hard", "extreme")
+    bucket_metrics: dict[str, dict[str, float | int | str]] = {}
+    for bucket in bucket_order:
+        b_rows = [r for r in rows if r.bucket == bucket]
+        b_metrics = aggregate_metrics(b_rows)
+        bucket_metrics[bucket] = {
+            "range": bucket_ranges[bucket],
+            "num_samples": len(b_rows),
+            **b_metrics,
+        }
 
     summary = {
         "dataset": args.dataset_name,
@@ -300,20 +358,28 @@ def main() -> None:
         "obj_threshold": args.obj_threshold,
         "iou_threshold": args.iou_threshold,
         "box_coord_mode": args.box_coord_mode,
-        "vision_enabled": bool(use_vision),
-        "metrics": {
-            "count_mae": count_mae,
-            "count_accuracy": count_acc,
-            "precision": precision,
-            "recall": recall,
-            "f1": f1,
+        "bucket_thresholds": {
+            "easy_max": args.easy_max,
+            "medium_max": args.medium_max,
+            "hard_max": args.hard_max,
         },
+        "vision_enabled": bool(use_vision),
+        "metrics": metrics,
+        "bucket_metrics": bucket_metrics,
         "rows": [asdict(r) for r in rows],
     }
     with open(args.output_json, "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
 
     print(json.dumps(summary["metrics"], indent=2))
+    print("Bucket metrics:")
+    for bucket in bucket_order:
+        bm = bucket_metrics[bucket]
+        print(
+            f"  {bucket:<7} range={bm['range']:<8} n={bm['num_samples']:<4} "
+            f"mae={bm['count_mae']:.3f} acc={bm['count_accuracy']:.3f} "
+            f"p={bm['precision']:.3f} r={bm['recall']:.3f} f1={bm['f1']:.3f}"
+        )
     print(f"Saved eval json: {args.output_json}")
 
 

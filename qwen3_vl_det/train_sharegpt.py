@@ -11,6 +11,7 @@ import argparse
 import json
 import os
 import re
+from dataclasses import asdict
 from dataclasses import dataclass
 from typing import Any
 
@@ -357,7 +358,18 @@ def main() -> None:
     os.makedirs(ckpt_dir, exist_ok=True)
     model.base_model.save_pretrained(ckpt_dir)
     tokenizer.save_pretrained(ckpt_dir)
-    print(f"Saved base model checkpoint to: {ckpt_dir}")
+    torch.save(
+        {
+            "adapter_state_dict": model.state_dict(),
+            "num_queries": args.num_queries,
+            "hungarian_cfg": asdict(model.hungarian_cfg),
+            "loss_cfg": asdict(model.loss_cfg),
+        },
+        os.path.join(ckpt_dir, "adapter.pt"),
+    )
+    with open(os.path.join(ckpt_dir, "train_args.json"), "w", encoding="utf-8") as f:
+        json.dump(asdict(args), f, indent=2)
+    print(f"Saved checkpoint to: {ckpt_dir}")
 
 
 if __name__ == "__main__":

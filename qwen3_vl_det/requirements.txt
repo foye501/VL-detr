@@ -1,3 +1,4 @@
 torch>=2.1
 transformers>=4.48
 scipy>=1.10
+datasets>=2.20

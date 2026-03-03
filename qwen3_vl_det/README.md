@@ -18,6 +18,7 @@ It is designed as a patch layer for your existing training code.
 - `train_stub.py`: minimal loop showing how to pass:
   - `query_positions` (`[B, Q]`)
   - `gt_boxes` (`list[tensor[Gi,4]]`)
+- `train_sharegpt.py`: end-to-end finetune script for ShareGPT-style datasets with `<box> [...] </box>` annotations
 
 ## Integration Steps In Your Real Trainer
 
@@ -40,6 +41,45 @@ It is designed as a patch layer for your existing training code.
 - `gt_boxes` must be normalized to `[0,1]` in `cx, cy, w, h`.
 - If your Qwen3-VL checkpoint requires a model class different from `AutoModelForCausalLM`,
   keep your existing model loader and pass the already-loaded model to `Qwen3VLDetrAdapter(...)`.
+
+## Finetuning On Your Dataset
+
+For dataset `foye501/VLM-Counting-dataset-qwenvl-sharegpt`, run:
+
+```bash
+python -m qwen3_vl_det.train_sharegpt \
+  --dataset-name foye501/VLM-Counting-dataset-qwenvl-sharegpt \
+  --train-split train \
+  --model-name Qwen/Qwen2.5-VL-3B-Instruct \
+  --num-queries 32 \
+  --batch-size 1 \
+  --grad-accum-steps 8 \
+  --epochs 1 \
+  --lr 2e-5 \
+  --max-length 2048 \
+  --lm-weight 1.0 \
+  --det-weight 0.7 \
+  --output-dir qwen3_vl_det/checkpoints
+```
+
+Quick smoke run:
+
+```bash
+python -m qwen3_vl_det.train_sharegpt \
+  --dataset-name foye501/VLM-Counting-dataset-qwenvl-sharegpt \
+  --max-samples 32 \
+  --max-steps 20 \
+  --num-queries 16 \
+  --batch-size 1 \
+  --grad-accum-steps 4
+```
+
+The script automatically:
+- loads ShareGPT `conversations/messages`
+- removes `<image>` marker from user text
+- parses assistant boxes from `<box> [x1, y1, x2, y2] </box>`
+- normalizes boxes to `cx, cy, w, h` in `[0,1]`
+- injects `DET_QUERY` tokens and computes `query_positions`
 
 ## Why This Helps Your Paper
 

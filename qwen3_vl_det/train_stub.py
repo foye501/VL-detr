@@ -110,9 +110,9 @@ def main() -> None:
         det_loss = out.get("det_loss")
         lm_loss = out.get("lm_loss")
         print(
-            f"step={step} total={float(loss):.4f} "
-            f"lm={float(lm_loss) if lm_loss is not None else -1:.4f} "
-            f"det={float(det_loss) if det_loss is not None else -1:.4f}"
+            f"step={step} total={loss.detach().item():.4f} "
+            f"lm={(lm_loss.detach().item() if lm_loss is not None else -1):.4f} "
+            f"det={(det_loss.detach().item() if det_loss is not None else -1):.4f}"
         )
 
 

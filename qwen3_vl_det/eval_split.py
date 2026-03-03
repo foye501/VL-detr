@@ -64,6 +64,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num-queries", type=int, default=32)
     p.add_argument("--obj-threshold", type=float, default=0.5)
     p.add_argument("--iou-threshold", type=float, default=0.5)
+    p.add_argument("--box-coord-mode", choices=["auto", "absolute", "norm1000", "norm01"], default="auto")
     p.add_argument("--model-name", default="")
     p.add_argument("--hf-token", default="")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -249,7 +250,12 @@ def main() -> None:
         pred_boxes = box_pred[keep].detach().cpu()
         pred_xyxy = cxcywh_to_xyxy_abs(pred_boxes, width=w, height=h)
 
-        gt_boxes = parse_boxes_from_text(assistant_text, width=w, height=h)
+        gt_boxes = parse_boxes_from_text(
+            assistant_text,
+            width=w,
+            height=h,
+            coord_mode=args.box_coord_mode,
+        )
         gt_xyxy = cxcywh_to_xyxy_abs(gt_boxes, width=w, height=h)
 
         precision, recall, f1 = detection_prf(pred_xyxy, gt_xyxy, iou_thr=args.iou_threshold)
@@ -293,6 +299,7 @@ def main() -> None:
         "num_samples": len(rows),
         "obj_threshold": args.obj_threshold,
         "iou_threshold": args.iou_threshold,
+        "box_coord_mode": args.box_coord_mode,
         "vision_enabled": bool(use_vision),
         "metrics": {
             "count_mae": count_mae,

@@ -19,6 +19,7 @@ class HungarianLossConfig:
     bbox_loss_weight: float = 5.0
     giou_loss_weight: float = 2.0
     obj_loss_weight: float = 1.0
+    count_loss_weight: float = 0.5
 
 
 def box_cxcywh_to_xyxy(boxes: torch.Tensor) -> torch.Tensor:
@@ -144,6 +145,18 @@ def detr_hungarian_loss(
     weights[obj_targets < 0.5] = cfg.no_object_weight
     obj_loss = (bce * weights).mean()
 
+    # Penalize global count mismatch to reduce "all slots active" collapse.
+    pred_count = pred_obj_logits.sigmoid().sum(dim=1)
+    gt_count = torch.tensor(
+        [float(gt.shape[0]) for gt in gt_boxes],
+        device=device,
+        dtype=pred_obj_logits.dtype,
+    )
+    count_loss = F.l1_loss(
+        pred_count / float(num_queries),
+        gt_count / float(num_queries),
+    )
+
     if all_box_l1:
         box_l1 = torch.cat(all_box_l1).mean()
         box_giou = torch.cat(all_box_giou).mean()
@@ -155,6 +168,7 @@ def detr_hungarian_loss(
         cfg.obj_loss_weight * obj_loss
         + cfg.bbox_loss_weight * box_l1
         + cfg.giou_loss_weight * box_giou
+        + cfg.count_loss_weight * count_loss
     )
 
     stats = {
@@ -162,6 +176,9 @@ def detr_hungarian_loss(
         "det_obj_loss": float(obj_loss.detach().cpu()),
         "det_l1_loss": float(box_l1.detach().cpu()),
         "det_giou_loss": float(box_giou.detach().cpu()),
+        "det_count_loss": float(count_loss.detach().cpu()),
         "det_matches": float(matched_count),
+        "pred_count_mean": float(pred_count.detach().mean().cpu()),
+        "gt_count_mean": float(gt_count.detach().mean().cpu()),
     }
     return loss, stats

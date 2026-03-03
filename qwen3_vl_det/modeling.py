@@ -69,8 +69,15 @@ class Qwen3VLDetrAdapter(nn.Module):
         self.num_queries = num_queries
         self.obj_head = nn.Linear(hidden_size, 1)
         self.box_head = nn.Linear(hidden_size, 4)
+        if self.obj_head.bias is not None:
+            # Start conservative so unmatched slots don't all activate early.
+            nn.init.constant_(self.obj_head.bias, -2.0)
         self.hungarian_cfg = hungarian_cfg or HungarianLossConfig()
         self.loss_cfg = loss_cfg or AdapterLossConfig()
+
+    def set_objectness_bias(self, bias: float) -> None:
+        if self.obj_head.bias is not None:
+            nn.init.constant_(self.obj_head.bias, bias)
 
     @classmethod
     def from_pretrained(

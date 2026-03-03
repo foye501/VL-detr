@@ -28,6 +28,8 @@ from qwen3_vl_det.train_sharegpt import (
     _extract_user_assistant,
     find_query_positions,
     load_processor,
+    _infer_box_coord_mode,
+    extract_boxes_raw,
     parse_boxes_from_text,
 )
 
@@ -40,6 +42,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--sample-index", type=int, default=0)
     p.add_argument("--num-queries", type=int, default=32)
     p.add_argument("--obj-threshold", type=float, default=0.5)
+    p.add_argument("--box-coord-mode", choices=["auto", "absolute", "norm1000", "norm01"], default="auto")
     p.add_argument("--model-name", default="")
     p.add_argument("--hf-token", default="")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -177,7 +180,10 @@ def main() -> None:
     pred_boxes = box_pred[keep].detach().cpu()
     pred_xyxy = cxcywh_to_xyxy_abs(pred_boxes, width=w, height=h)
 
-    gt_boxes = parse_boxes_from_text(assistant_text, width=w, height=h)
+    raw_boxes = extract_boxes_raw(assistant_text)
+    inferred_mode = _infer_box_coord_mode(raw_boxes, width=w, height=h)
+    used_mode = inferred_mode if args.box_coord_mode == "auto" else args.box_coord_mode
+    gt_boxes = parse_boxes_from_text(assistant_text, width=w, height=h, coord_mode=args.box_coord_mode)
     gt_xyxy = cxcywh_to_xyxy_abs(gt_boxes, width=w, height=h)
 
     vis = img.copy()
@@ -188,6 +194,28 @@ def main() -> None:
     print(f"Saved overlay: {args.output_image}")
     print(f"GT count: {gt_boxes.shape[0]}")
     print(f"Pred count (@{args.obj_threshold:.2f}): {pred_boxes.shape[0]}")
+    print(f"Image size: {w}x{h}")
+    print(f"Box coord mode: requested={args.box_coord_mode}, inferred={inferred_mode}, used={used_mode}")
+    if gt_boxes.numel() > 0:
+        print(
+            "GT box stats (norm cxcywh):",
+            {
+                "cx_mean": round(float(gt_boxes[:, 0].mean()), 4),
+                "cy_mean": round(float(gt_boxes[:, 1].mean()), 4),
+                "w_mean": round(float(gt_boxes[:, 2].mean()), 4),
+                "h_mean": round(float(gt_boxes[:, 3].mean()), 4),
+            },
+        )
+    if pred_boxes.numel() > 0:
+        print(
+            "Pred box stats (norm cxcywh):",
+            {
+                "cx_mean": round(float(pred_boxes[:, 0].mean()), 4),
+                "cy_mean": round(float(pred_boxes[:, 1].mean()), 4),
+                "w_mean": round(float(pred_boxes[:, 2].mean()), 4),
+                "h_mean": round(float(pred_boxes[:, 3].mean()), 4),
+            },
+        )
     print("Pred objectness (first 10):", [round(float(x), 4) for x in obj_prob[:10].detach().cpu()])
 
 

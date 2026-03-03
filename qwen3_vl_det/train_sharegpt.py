@@ -1,4 +1,4 @@
-"""Train Qwen2.5-VL with DETR-style Hungarian supervision on ShareGPT-style data.
+"""Train Qwen3-VL with DETR-style Hungarian supervision on ShareGPT-style data.
 
 Expected sample format (one of the supported variants):
 - {"image": <PIL or image path>, "conversations": [{"from":"human","value":"<image>..."}, ...]}
@@ -50,13 +50,20 @@ BOX_PATTERN = re.compile(
 class TrainArgs:
     dataset_name: str = "foye501/VLM-Counting-dataset-qwenvl-sharegpt"
     train_split: str = "train"
-    model_name: str = "Qwen/Qwen2.5-VL-3B-Instruct"
+    model_name: str = "Qwen/Qwen3-VL-2B-Instruct"
     output_dir: str = "qwen3_vl_det/checkpoints"
     num_queries: int = 32
     batch_size: int = 1
     grad_accum_steps: int = 8
     epochs: int = 1
     lr: float = 2e-5
+    class_cost: float = 1.0
+    bbox_cost: float = 5.0
+    giou_cost: float = 2.0
+    no_object_weight: float = 0.5
+    count_loss_weight: float = 0.5
+    obj_bias_init: float = -2.0
+    grad_clip_norm: float = 1.0
     max_length: int = 2048
     max_steps: int = 0
     max_samples: int = 0
@@ -65,13 +72,14 @@ class TrainArgs:
     det_weight: float = 0.7
     train_heads_only: bool = False
     require_vision: bool = False
+    box_coord_mode: str = "auto"  # auto | absolute | norm1000 | norm01
     seed: int = 7
     hf_token: str = ""
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 def parse_args() -> TrainArgs:
-    p = argparse.ArgumentParser(description="Qwen2.5-VL + DETR Hungarian finetuning on ShareGPT-style data.")
+    p = argparse.ArgumentParser(description="Qwen3-VL + DETR Hungarian finetuning on ShareGPT-style data.")
     p.add_argument("--dataset-name", default=TrainArgs.dataset_name)
     p.add_argument("--train-split", default=TrainArgs.train_split)
     p.add_argument("--model-name", default=TrainArgs.model_name)
@@ -81,6 +89,13 @@ def parse_args() -> TrainArgs:
     p.add_argument("--grad-accum-steps", type=int, default=TrainArgs.grad_accum_steps)
     p.add_argument("--epochs", type=int, default=TrainArgs.epochs)
     p.add_argument("--lr", type=float, default=TrainArgs.lr)
+    p.add_argument("--class-cost", type=float, default=TrainArgs.class_cost)
+    p.add_argument("--bbox-cost", type=float, default=TrainArgs.bbox_cost)
+    p.add_argument("--giou-cost", type=float, default=TrainArgs.giou_cost)
+    p.add_argument("--no-object-weight", type=float, default=TrainArgs.no_object_weight)
+    p.add_argument("--count-loss-weight", type=float, default=TrainArgs.count_loss_weight)
+    p.add_argument("--obj-bias-init", type=float, default=TrainArgs.obj_bias_init)
+    p.add_argument("--grad-clip-norm", type=float, default=TrainArgs.grad_clip_norm)
     p.add_argument("--max-length", type=int, default=TrainArgs.max_length)
     p.add_argument("--max-steps", type=int, default=TrainArgs.max_steps)
     p.add_argument("--max-samples", type=int, default=TrainArgs.max_samples)
@@ -89,6 +104,11 @@ def parse_args() -> TrainArgs:
     p.add_argument("--det-weight", type=float, default=TrainArgs.det_weight)
     p.add_argument("--train-heads-only", action="store_true")
     p.add_argument("--require-vision", action="store_true")
+    p.add_argument(
+        "--box-coord-mode",
+        choices=["auto", "absolute", "norm1000", "norm01"],
+        default=TrainArgs.box_coord_mode,
+    )
     p.add_argument("--seed", type=int, default=TrainArgs.seed)
     p.add_argument("--hf-token", default=TrainArgs.hf_token)
     p.add_argument("--device", default=TrainArgs.device)
@@ -144,10 +164,59 @@ def _extract_image(example: dict[str, Any]):
     raise KeyError("No image field found. Expected one of: image/images/img.")
 
 
-def parse_boxes_from_text(text: str, width: int, height: int) -> torch.Tensor:
+def extract_boxes_raw(text: str) -> list[list[float]]:
     boxes = []
     for m in BOX_PATTERN.finditer(text):
         x1, y1, x2, y2 = [float(m.group(i)) for i in range(1, 5)]
+        boxes.append([x1, y1, x2, y2])
+    return boxes
+
+
+def _infer_box_coord_mode(raw_boxes: list[list[float]], width: int, height: int) -> str:
+    if not raw_boxes:
+        return "absolute"
+    max_coord = max(max(b) for b in raw_boxes)
+    max_dim = max(width, height)
+    if max_coord <= 1.5:
+        return "norm01"
+    # Common for Qwen grounding outputs: 0..1000 normalized coordinates.
+    if max_coord <= 1005:
+        for x1, y1, x2, y2 in raw_boxes:
+            if x1 > width * 1.02 or x2 > width * 1.02 or y1 > height * 1.02 or y2 > height * 1.02:
+                return "norm1000"
+        if max_coord > (max_dim * 1.05):
+            return "norm1000"
+    return "absolute"
+
+
+def _convert_raw_box_to_pixels(
+    box: list[float],
+    width: int,
+    height: int,
+    mode: str,
+) -> tuple[float, float, float, float]:
+    x1, y1, x2, y2 = box
+    if mode == "norm1000":
+        x1, x2 = x1 / 1000.0 * width, x2 / 1000.0 * width
+        y1, y2 = y1 / 1000.0 * height, y2 / 1000.0 * height
+    elif mode == "norm01":
+        x1, x2 = x1 * width, x2 * width
+        y1, y2 = y1 * height, y2 * height
+    # absolute mode keeps values unchanged.
+    return x1, y1, x2, y2
+
+
+def parse_boxes_from_text(
+    text: str,
+    width: int,
+    height: int,
+    coord_mode: str = "auto",
+) -> torch.Tensor:
+    raw_boxes = extract_boxes_raw(text)
+    mode = _infer_box_coord_mode(raw_boxes, width=width, height=height) if coord_mode == "auto" else coord_mode
+    boxes = []
+    for raw in raw_boxes:
+        x1, y1, x2, y2 = _convert_raw_box_to_pixels(raw, width=width, height=height, mode=mode)
         x1 = max(0.0, min(x1, float(width)))
         x2 = max(0.0, min(x2, float(width)))
         y1 = max(0.0, min(y1, float(height)))
@@ -179,11 +248,19 @@ def find_query_positions(input_ids: torch.Tensor, query_token_id: int, num_queri
 
 
 class ShareGptCollator:
-    def __init__(self, processor, num_queries: int, max_length: int, use_vision: bool) -> None:
+    def __init__(
+        self,
+        processor,
+        num_queries: int,
+        max_length: int,
+        use_vision: bool,
+        box_coord_mode: str,
+    ) -> None:
         self.processor = processor
         self.num_queries = num_queries
         self.max_length = max_length
         self.use_vision = use_vision
+        self.box_coord_mode = box_coord_mode
         self.query_token_id = int(processor.tokenizer.convert_tokens_to_ids(DET_QUERY_TOKEN))
         if self.query_token_id < 0:
             raise ValueError(f"{DET_QUERY_TOKEN} token id not found in tokenizer.")
@@ -224,7 +301,14 @@ class ShareGptCollator:
             )
             texts.append(chat_text)
             images.append(img)
-            gt_boxes.append(parse_boxes_from_text(assistant_text, width=width, height=height))
+            gt_boxes.append(
+                parse_boxes_from_text(
+                    assistant_text,
+                    width=width,
+                    height=height,
+                    coord_mode=self.box_coord_mode,
+                )
+            )
 
         if self.use_vision:
             inputs = self.processor(
@@ -355,12 +439,14 @@ def main() -> None:
     )
     model.base_model.resize_token_embeddings(len(tokenizer))
     model.hungarian_cfg = HungarianLossConfig(
-        class_cost=1.0,
-        bbox_cost=5.0,
-        giou_cost=2.0,
-        no_object_weight=0.1,
+        class_cost=args.class_cost,
+        bbox_cost=args.bbox_cost,
+        giou_cost=args.giou_cost,
+        no_object_weight=args.no_object_weight,
+        count_loss_weight=args.count_loss_weight,
     )
     model.loss_cfg = AdapterLossConfig(lm_weight=args.lm_weight, det_weight=args.det_weight)
+    model.set_objectness_bias(args.obj_bias_init)
 
     if args.train_heads_only:
         for p in model.base_model.parameters():
@@ -375,6 +461,7 @@ def main() -> None:
         num_queries=args.num_queries,
         max_length=args.max_length,
         use_vision=use_vision,
+        box_coord_mode=args.box_coord_mode,
     )
     loader = DataLoader(
         ds,
@@ -410,17 +497,23 @@ def main() -> None:
             loss.backward()
 
             if global_step % args.grad_accum_steps == 0:
+                if args.grad_clip_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(trainable_params, args.grad_clip_norm)
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
 
             if global_step % args.log_every == 0:
                 lm = out.get("lm_loss")
                 det = out.get("det_loss")
+                det_stats = out.get("det_stats", {})
+                pred_count = det_stats.get("pred_count_mean", -1.0)
+                gt_count = det_stats.get("gt_count_mean", -1.0)
                 print(
                     f"epoch={epoch} step={global_step} "
                     f"total={out['loss'].detach().item():.4f} "
                     f"lm={(lm.detach().item() if lm is not None else -1):.4f} "
-                    f"det={(det.detach().item() if det is not None else -1):.4f}"
+                    f"det={(det.detach().item() if det is not None else -1):.4f} "
+                    f"pred_count={pred_count:.2f} gt_count={gt_count:.2f}"
                 )
 
         if args.max_steps > 0 and global_step >= args.max_steps:

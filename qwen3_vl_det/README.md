@@ -33,7 +33,9 @@ It is designed as a patch layer for your existing training code.
 - `num_queries = 32` (increase for dense scenes)
 - `lm_weight = 1.0`, `det_weight = 1.0`
 - Hungarian cost: `class=1.0`, `bbox=5.0`, `giou=2.0`
-- No-object weight: `0.1`
+- No-object weight: `0.5`
+- Count regularization: `count_loss_weight=0.5`
+- Objectness prior bias: `obj_bias_init=-2.0`
 
 ## Important Notes
 
@@ -51,7 +53,7 @@ python -m qwen3_vl_det.train_sharegpt \
   --dataset-name foye501/VLM-Counting-dataset-qwenvl-sharegpt \
   --train-split train \
   --require-vision \
-  --model-name Qwen/Qwen2.5-VL-3B-Instruct \
+  --model-name Qwen/Qwen3-VL-2B-Instruct \
   --num-queries 32 \
   --batch-size 1 \
   --grad-accum-steps 8 \
@@ -60,6 +62,10 @@ python -m qwen3_vl_det.train_sharegpt \
   --max-length 2048 \
   --lm-weight 1.0 \
   --det-weight 0.7 \
+  --box-coord-mode auto \
+  --no-object-weight 0.5 \
+  --count-loss-weight 0.5 \
+  --obj-bias-init -2.0 \
   --output-dir qwen3_vl_det/checkpoints
 ```
 
@@ -83,6 +89,18 @@ The script automatically:
 - normalizes boxes to `cx, cy, w, h` in `[0,1]`
 - injects `DET_QUERY` tokens and computes `query_positions`
 
+Before training, inspect coordinate scale once:
+
+```bash
+python -m qwen3_vl_det.inspect_boxes \
+  --dataset-name foye501/VLM-Counting-dataset-qwenvl-sharegpt \
+  --split train \
+  --max-samples 500
+```
+
+If it reports `suggested_box_coord_mode=norm1000`, train/eval with:
+- `--box-coord-mode norm1000`
+
 ## One-Sample Evaluation + Plot
 
 After training, test one sample and save overlay image:
@@ -94,6 +112,7 @@ python -m qwen3_vl_det.eval_one \
   --sample-index 0 \
   --num-queries 32 \
   --require-vision \
+  --box-coord-mode auto \
   --obj-threshold 0.5 \
   --output-image qwen3_vl_det/eval_sample0.png
 ```
@@ -115,6 +134,7 @@ python -m qwen3_vl_det.eval_split \
   --start-index 9000 \
   --max-samples 500 \
   --num-queries 32 \
+  --box-coord-mode auto \
   --obj-threshold 0.5 \
   --iou-threshold 0.5 \
   --require-vision \

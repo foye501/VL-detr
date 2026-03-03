@@ -81,6 +81,24 @@ The script automatically:
 - normalizes boxes to `cx, cy, w, h` in `[0,1]`
 - injects `DET_QUERY` tokens and computes `query_positions`
 
+## One-Sample Evaluation + Plot
+
+After training, test one sample and save overlay image:
+
+```bash
+python -m qwen3_vl_det.eval_one \
+  --checkpoint-dir qwen3_vl_det/checkpoints_run1/last \
+  --dataset-name foye501/VLM-Counting-dataset-qwenvl-sharegpt \
+  --sample-index 0 \
+  --num-queries 32 \
+  --obj-threshold 0.5 \
+  --output-image qwen3_vl_det/eval_sample0.png
+```
+
+Output image:
+- green boxes = GT
+- red boxes = prediction
+
 ## Why This Helps Your Paper
 
 - Forces one-to-one instance assignment (reduces duplicate counting).

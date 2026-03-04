@@ -617,12 +617,15 @@ def main() -> None:
                 det_stats = out.get("det_stats", {})
                 pred_count = det_stats.get("pred_count_mean", -1.0)
                 gt_count = det_stats.get("gt_count_mean", -1.0)
+                obj_pos = det_stats.get("det_obj_pos_loss", -1.0)
+                obj_neg = det_stats.get("det_obj_neg_loss", -1.0)
                 print(
                     f"epoch={epoch} step={global_step} "
                     f"total={out['loss'].detach().item():.4f} "
                     f"lm={(lm.detach().item() if lm is not None else -1):.4f} "
                     f"det={(det.detach().item() if det is not None else -1):.4f} "
-                    f"pred_count={pred_count:.2f} gt_count={gt_count:.2f}"
+                    f"pred_count={pred_count:.2f} gt_count={gt_count:.2f} "
+                    f"obj_pos={obj_pos:.3f} obj_neg={obj_neg:.3f}"
                 )
 
         if args.max_steps > 0 and global_step >= args.max_steps:

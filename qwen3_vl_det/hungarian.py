@@ -139,11 +139,20 @@ def detr_hungarian_loss(
         diag_giou = generalized_iou(pred_xyxy, gt_xyxy).diag()
         all_box_giou.append(1.0 - diag_giou)
 
-    # Objectness (with lower weight on no-object slots).
+    # Objectness: normalize positives/negatives separately so positive signal
+    # is not washed out when using many queries (e.g. Q=100).
     bce = F.binary_cross_entropy_with_logits(pred_obj_logits, obj_targets, reduction="none")
-    weights = torch.ones_like(bce)
-    weights[obj_targets < 0.5] = cfg.no_object_weight
-    obj_loss = (bce * weights).mean()
+    pos_mask = obj_targets > 0.5
+    neg_mask = ~pos_mask
+    if pos_mask.any():
+        obj_pos_loss = bce[pos_mask].mean()
+    else:
+        obj_pos_loss = torch.zeros((), device=device, dtype=bce.dtype)
+    if neg_mask.any():
+        obj_neg_loss = bce[neg_mask].mean()
+    else:
+        obj_neg_loss = torch.zeros((), device=device, dtype=bce.dtype)
+    obj_loss = obj_pos_loss + cfg.no_object_weight * obj_neg_loss
 
     # Penalize global count mismatch to reduce "all slots active" collapse.
     pred_count = pred_obj_logits.sigmoid().sum(dim=1)
@@ -174,10 +183,14 @@ def detr_hungarian_loss(
     stats = {
         "det_total_loss": float(loss.detach().cpu()),
         "det_obj_loss": float(obj_loss.detach().cpu()),
+        "det_obj_pos_loss": float(obj_pos_loss.detach().cpu()),
+        "det_obj_neg_loss": float(obj_neg_loss.detach().cpu()),
         "det_l1_loss": float(box_l1.detach().cpu()),
         "det_giou_loss": float(box_giou.detach().cpu()),
         "det_count_loss": float(count_loss.detach().cpu()),
         "det_matches": float(matched_count),
+        "det_pos_slots": float(pos_mask.sum().detach().cpu()),
+        "det_neg_slots": float(neg_mask.sum().detach().cpu()),
         "pred_count_mean": float(pred_count.detach().mean().cpu()),
         "gt_count_mean": float(gt_count.detach().mean().cpu()),
     }

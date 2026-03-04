@@ -124,6 +124,7 @@ python -m qwen3_vl_det.eval_one \
 Output image:
 - green boxes = GT
 - red boxes = prediction
+- `eval_one` also prints `Pred soft count (sum probs)` to compare against thresholded count.
 
 If you see `vision tensors are disabled in this fallback`, do not trust the result.
 Install vision dependencies and force strict mode with `--require-vision`.
@@ -176,6 +177,7 @@ python -m qwen3_vl_det.eval_split \
 
 `eval_split` now reports both overall metrics and bucket metrics (`easy`, `medium`, `hard`, `extreme`)
 based on GT count ranges configured by the threshold flags above.
+It includes both `count_mae` (thresholded hard count) and `count_soft_mae` (sum of objectness probabilities).
 
 ## Real Data Check (COCO Subset)
 

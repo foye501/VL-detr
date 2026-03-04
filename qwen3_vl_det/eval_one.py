@@ -239,6 +239,7 @@ def main() -> None:
     keep = obj_prob >= args.obj_threshold
     pred_boxes = box_pred[keep].detach().cpu()
     pred_xyxy = cxcywh_to_xyxy_abs(pred_boxes, width=w, height=h)
+    soft_count = float(obj_prob.sum().detach().cpu().item())
 
     raw_boxes = extract_boxes_raw(assistant_text)
     inferred_mode = _infer_box_coord_mode(raw_boxes, width=w, height=h)
@@ -309,6 +310,7 @@ def main() -> None:
     print(f"Saved overlay: {args.output_image}")
     print(f"GT count: {gt_boxes.shape[0]}")
     print(f"Pred count (@{args.obj_threshold:.2f}): {pred_boxes.shape[0]}")
+    print(f"Pred soft count (sum probs): {soft_count:.2f}")
     print(f"Image size: {w}x{h}")
     print(
         f"Box coord mode: requested={args.box_coord_mode}, checkpoint={ckpt_mode or 'n/a'}, "

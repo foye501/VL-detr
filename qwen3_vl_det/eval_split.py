@@ -48,6 +48,7 @@ class EvalRow:
     index: int
     gt_count: int
     pred_count: int
+    pred_count_soft: float
     abs_error: int
     precision: float
     recall: float
@@ -95,18 +96,21 @@ def aggregate_metrics(rows: list[EvalRow]) -> dict[str, float]:
     if not rows:
         return {
             "count_mae": 0.0,
+            "count_soft_mae": 0.0,
             "count_accuracy": 0.0,
             "precision": 0.0,
             "recall": 0.0,
             "f1": 0.0,
         }
     count_mae = sum(r.abs_error for r in rows) / len(rows)
+    count_soft_mae = sum(abs(r.pred_count_soft - r.gt_count) for r in rows) / len(rows)
     count_acc = sum(1.0 for r in rows if r.abs_error == 0) / len(rows)
     precision = sum(r.precision for r in rows) / len(rows)
     recall = sum(r.recall for r in rows) / len(rows)
     f1 = sum(r.f1 for r in rows) / len(rows)
     return {
         "count_mae": count_mae,
+        "count_soft_mae": count_soft_mae,
         "count_accuracy": count_acc,
         "precision": precision,
         "recall": recall,
@@ -312,6 +316,7 @@ def main() -> None:
         keep = obj_prob >= args.obj_threshold
         pred_boxes = box_pred[keep].detach().cpu()
         pred_xyxy = cxcywh_to_xyxy_abs(pred_boxes, width=w, height=h)
+        pred_count_soft = float(obj_prob.sum().detach().cpu().item())
 
         gt_boxes = parse_boxes_from_text(
             assistant_text,
@@ -329,6 +334,7 @@ def main() -> None:
             index=idx,
             gt_count=gt_count,
             pred_count=pred_count,
+            pred_count_soft=pred_count_soft,
             abs_error=abs(pred_count - gt_count),
             precision=precision,
             recall=recall,
@@ -405,7 +411,7 @@ def main() -> None:
         bm = bucket_metrics[bucket]
         print(
             f"  {bucket:<7} range={bm['range']:<8} n={bm['num_samples']:<4} "
-            f"mae={bm['count_mae']:.3f} acc={bm['count_accuracy']:.3f} "
+            f"mae={bm['count_mae']:.3f} soft_mae={bm['count_soft_mae']:.3f} acc={bm['count_accuracy']:.3f} "
             f"p={bm['precision']:.3f} r={bm['recall']:.3f} f1={bm['f1']:.3f}"
         )
     print(f"Saved eval json: {args.output_json}")

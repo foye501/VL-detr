@@ -128,6 +128,19 @@ Output image:
 If you see `vision tensors are disabled in this fallback`, do not trust the result.
 Install vision dependencies and force strict mode with `--require-vision`.
 
+To debug annotation interpretation, you can dump GT-only overlays for all mode/order combinations:
+
+```bash
+python -m qwen3_vl_det.eval_one \
+  --checkpoint-dir qwen3_vl_det/checkpoints_run2_fix/last \
+  --dataset-name foye501/VLM-Counting-dataset-qwenvl-sharegpt \
+  --sample-index 4000 \
+  --num-queries 100 \
+  --obj-threshold 1.1 \
+  --debug-all-gt-parses \
+  --debug-prefix qwen3_vl_det/gt_parse_4000
+```
+
 ## Split Evaluation (ShareGPT Dataset)
 
 ```bash

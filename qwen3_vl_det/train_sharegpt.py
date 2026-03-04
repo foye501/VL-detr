@@ -162,7 +162,9 @@ def _extract_user_assistant(messages: list[dict[str, Any]]) -> tuple[str, str]:
                 assistant_candidates.append((i, text, num_boxes))
 
     if assistant_candidates:
-        best_i, assistant_text, _ = max(assistant_candidates, key=lambda x: x[2])
+        # In multi-turn chats, the image annotation usually corresponds to the
+        # latest assistant turn with boxes, not the one with max box count.
+        best_i, assistant_text, _ = assistant_candidates[-1]
         user_text = ""
         for j in range(best_i - 1, -1, -1):
             role, text = parsed[j]

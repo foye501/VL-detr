@@ -49,6 +49,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--hf-token", default="")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--require-vision", action="store_true")
+    p.add_argument("--debug-all-gt-parses", action="store_true")
+    p.add_argument("--debug-prefix", default="qwen3_vl_det/gt_parse")
     p.add_argument("--output-image", default="qwen3_vl_det/eval_overlay.png")
     return p.parse_args()
 
@@ -195,6 +197,26 @@ def main() -> None:
         coord_order=args.box_coord_order,
     )
     gt_xyxy = cxcywh_to_xyxy_abs(gt_boxes, width=w, height=h)
+
+    if args.debug_all_gt_parses:
+        mode_candidates = ("absolute", "norm1000", "norm01")
+        order_candidates = ("xyxy", "yxyx")
+        for mode in mode_candidates:
+            for order in order_candidates:
+                dbg_boxes = parse_boxes_from_text(
+                    assistant_text,
+                    width=w,
+                    height=h,
+                    coord_mode=mode,
+                    coord_order=order,
+                )
+                dbg_xyxy = cxcywh_to_xyxy_abs(dbg_boxes, width=w, height=h)
+                dbg_img = img.copy()
+                draw_boxes(dbg_img, dbg_xyxy, color="lime", width=3)
+                dbg_path = f"{args.debug_prefix}_{mode}_{order}.png"
+                os.makedirs(os.path.dirname(dbg_path) or ".", exist_ok=True)
+                dbg_img.save(dbg_path)
+                print(f"Saved GT debug overlay ({mode},{order}) count={dbg_boxes.shape[0]}: {dbg_path}")
 
     vis = img.copy()
     draw_boxes(vis, gt_xyxy, color="lime", width=3)

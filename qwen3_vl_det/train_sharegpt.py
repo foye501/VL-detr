@@ -17,7 +17,7 @@ from typing import Any
 
 import torch
 import transformers
-from datasets import load_dataset
+from datasets import load_dataset, load_from_disk
 from torch.utils.data import DataLoader
 from transformers import AutoProcessor, AutoTokenizer
 
@@ -49,6 +49,7 @@ BOX_PATTERN = re.compile(
 @dataclass
 class TrainArgs:
     dataset_name: str = "foye501/VLM-Counting-dataset-qwenvl-sharegpt"
+    dataset_from_disk: str = ""
     train_split: str = "train"
     model_name: str = "Qwen/Qwen3-VL-2B-Instruct"
     output_dir: str = "qwen3_vl_det/checkpoints"
@@ -82,6 +83,7 @@ class TrainArgs:
 def parse_args() -> TrainArgs:
     p = argparse.ArgumentParser(description="Qwen3-VL + DETR Hungarian finetuning on ShareGPT-style data.")
     p.add_argument("--dataset-name", default=TrainArgs.dataset_name)
+    p.add_argument("--dataset-from-disk", default=TrainArgs.dataset_from_disk)
     p.add_argument("--train-split", default=TrainArgs.train_split)
     p.add_argument("--model-name", default=TrainArgs.model_name)
     p.add_argument("--output-dir", default=TrainArgs.output_dir)
@@ -120,6 +122,23 @@ def parse_args() -> TrainArgs:
     p.add_argument("--device", default=TrainArgs.device)
     ns = p.parse_args()
     return TrainArgs(**vars(ns))
+
+
+def load_split_dataset(
+    dataset_name: str,
+    split: str,
+    token: Any,
+    dataset_from_disk: str = "",
+):
+    """Load either HF hub dataset or local `save_to_disk` dataset."""
+    if dataset_from_disk:
+        ds = load_from_disk(dataset_from_disk)
+        if hasattr(ds, "keys"):  # DatasetDict
+            if split not in ds:
+                raise KeyError(f"Split '{split}' not found in dataset_from_disk: {dataset_from_disk}")
+            return ds[split]
+        return ds
+    return load_dataset(dataset_name, split=split, token=token)
 
 
 def _as_messages(example: dict[str, Any]) -> list[dict[str, Any]]:
@@ -204,6 +223,17 @@ def _extract_image(example: dict[str, Any]):
             return val[0]
         return val
     raise KeyError("No image field found. Expected one of: image/images/img.")
+
+
+def extract_user_assistant_from_example(example: dict[str, Any]) -> tuple[str, str]:
+    """Extract user/assistant text from either normalized or ShareGPT-style sample."""
+    user_text = example.get("user_text", "")
+    assistant_text = example.get("assistant_text", "")
+    if isinstance(user_text, str) and isinstance(assistant_text, str):
+        if user_text.strip() and assistant_text.strip():
+            return user_text, assistant_text
+    messages = _as_messages(example)
+    return _extract_user_assistant(messages)
 
 
 def extract_boxes_raw(text: str) -> list[list[float]]:
@@ -338,6 +368,109 @@ def parse_boxes_from_text(
     return torch.tensor(boxes, dtype=torch.float32)
 
 
+def cxcywh_norm_to_xyxy_abs(boxes: torch.Tensor, width: int, height: int) -> torch.Tensor:
+    if boxes.numel() == 0:
+        return torch.zeros((0, 4), dtype=torch.float32)
+    cx, cy, w, h = boxes.unbind(-1)
+    x1 = (cx - 0.5 * w) * width
+    y1 = (cy - 0.5 * h) * height
+    x2 = (cx + 0.5 * w) * width
+    y2 = (cy + 0.5 * h) * height
+    out = torch.stack([x1, y1, x2, y2], dim=-1)
+    out[:, [0, 2]] = out[:, [0, 2]].clamp(0, width)
+    out[:, [1, 3]] = out[:, [1, 3]].clamp(0, height)
+    return out
+
+
+def _boxes_xyxy_abs_to_cxcywh_norm(boxes_xyxy: torch.Tensor, width: int, height: int) -> torch.Tensor:
+    if boxes_xyxy.numel() == 0:
+        return torch.zeros((0, 4), dtype=torch.float32)
+    x1, y1, x2, y2 = boxes_xyxy.unbind(-1)
+    x1 = x1.clamp(0, width)
+    x2 = x2.clamp(0, width)
+    y1 = y1.clamp(0, height)
+    y2 = y2.clamp(0, height)
+    w = (x2 - x1).clamp(min=0)
+    h = (y2 - y1).clamp(min=0)
+    valid = (w > 0) & (h > 0)
+    if valid.sum() == 0:
+        return torch.zeros((0, 4), dtype=torch.float32)
+    x1 = x1[valid]
+    x2 = x2[valid]
+    y1 = y1[valid]
+    y2 = y2[valid]
+    cx = ((x1 + x2) / 2.0) / float(width)
+    cy = ((y1 + y2) / 2.0) / float(height)
+    ww = (x2 - x1) / float(width)
+    hh = (y2 - y1) / float(height)
+    out = torch.stack([cx, cy, ww, hh], dim=-1)
+    return out.clamp(0, 1)
+
+
+def _as_float_box_tensor(value: Any) -> torch.Tensor:
+    if value is None:
+        return torch.zeros((0, 4), dtype=torch.float32)
+    t = torch.as_tensor(value, dtype=torch.float32)
+    if t.numel() == 0:
+        return torch.zeros((0, 4), dtype=torch.float32)
+    if t.dim() == 1:
+        if int(t.shape[0]) != 4:
+            raise ValueError(f"Expected box vector of length 4, got shape {tuple(t.shape)}")
+        t = t.unsqueeze(0)
+    if t.dim() != 2 or int(t.shape[1]) != 4:
+        raise ValueError(f"Expected box tensor shape [N,4], got {tuple(t.shape)}")
+    return t
+
+
+def extract_gt_boxes_from_example(
+    example: dict[str, Any],
+    width: int,
+    height: int,
+    assistant_text: str,
+    coord_mode: str = "auto",
+    coord_order: str = "auto",
+) -> torch.Tensor:
+    """Extract GT boxes with support for normalized dataset fields and ShareGPT text boxes."""
+    # Preferred normalized field.
+    if "boxes_cxcywh_norm" in example and example["boxes_cxcywh_norm"] is not None:
+        t = _as_float_box_tensor(example["boxes_cxcywh_norm"]).clamp(0, 1)
+        if t.numel() == 0:
+            return t
+        valid = (t[:, 2] > 0) & (t[:, 3] > 0)
+        return t[valid]
+
+    # Absolute xyxy field.
+    if "boxes_xyxy_abs" in example and example["boxes_xyxy_abs"] is not None:
+        t = _as_float_box_tensor(example["boxes_xyxy_abs"])
+        return _boxes_xyxy_abs_to_cxcywh_norm(t, width=width, height=height)
+
+    # 1000-scale xyxy field.
+    if "boxes_xyxy_1000" in example and example["boxes_xyxy_1000"] is not None:
+        t = _as_float_box_tensor(example["boxes_xyxy_1000"])
+        t[:, [0, 2]] = t[:, [0, 2]] / 1000.0 * float(width)
+        t[:, [1, 3]] = t[:, [1, 3]] / 1000.0 * float(height)
+        return _boxes_xyxy_abs_to_cxcywh_norm(t, width=width, height=height)
+
+    # 1000-scale yxyx field.
+    if "boxes_yxyx_1000" in example and example["boxes_yxyx_1000"] is not None:
+        t = _as_float_box_tensor(example["boxes_yxyx_1000"])
+        y1 = t[:, 0] / 1000.0 * float(height)
+        x1 = t[:, 1] / 1000.0 * float(width)
+        y2 = t[:, 2] / 1000.0 * float(height)
+        x2 = t[:, 3] / 1000.0 * float(width)
+        xyxy = torch.stack([x1, y1, x2, y2], dim=-1)
+        return _boxes_xyxy_abs_to_cxcywh_norm(xyxy, width=width, height=height)
+
+    # Fallback: parse from assistant text.
+    return parse_boxes_from_text(
+        assistant_text,
+        width=width,
+        height=height,
+        coord_mode=coord_mode,
+        coord_order=coord_order,
+    )
+
+
 def find_query_positions(input_ids: torch.Tensor, query_token_id: int, num_queries: int) -> torch.Tensor:
     bsz = input_ids.shape[0]
     out = torch.full((bsz, num_queries), -1, dtype=torch.long, device=input_ids.device)
@@ -378,8 +511,7 @@ class ShareGptCollator:
         gt_boxes: list[torch.Tensor] = []
 
         for ex in batch:
-            messages = _as_messages(ex)
-            user_text, assistant_text = _extract_user_assistant(messages)
+            user_text, assistant_text = extract_user_assistant_from_example(ex)
             img = _extract_image(ex)
             width, height = img.size
 
@@ -409,10 +541,11 @@ class ShareGptCollator:
             texts.append(chat_text)
             images.append(img)
             gt_boxes.append(
-                parse_boxes_from_text(
-                    assistant_text,
+                extract_gt_boxes_from_example(
+                    ex,
                     width=width,
                     height=height,
+                    assistant_text=assistant_text,
                     coord_mode=self.box_coord_mode,
                     coord_order=self.box_coord_order,
                 )
@@ -525,7 +658,12 @@ def main() -> None:
     torch.manual_seed(args.seed)
 
     token = args.hf_token if args.hf_token else True
-    ds = load_dataset(args.dataset_name, split=args.train_split, token=token)
+    ds = load_split_dataset(
+        dataset_name=args.dataset_name,
+        split=args.train_split,
+        token=token,
+        dataset_from_disk=args.dataset_from_disk,
+    )
     if args.max_samples > 0:
         ds = ds.select(range(min(args.max_samples, len(ds))))
     print(f"Loaded dataset: {args.dataset_name} split={args.train_split} size={len(ds)}")

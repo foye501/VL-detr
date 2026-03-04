@@ -9,20 +9,19 @@ from dataclasses import asdict
 from typing import Any
 
 import torch
-from datasets import load_dataset
 from PIL import ImageDraw
 from transformers import AutoTokenizer
 
 from qwen3_vl_det.modeling import AuxDetrBranchConfig, Qwen3VLAuxDetrAdapter
 from qwen3_vl_det.train_sharegpt import (
-    _as_messages,
     _extract_image,
-    _extract_user_assistant,
+    extract_gt_boxes_from_example,
+    extract_user_assistant_from_example,
     _infer_box_coord_mode,
     _infer_box_coord_order,
     extract_boxes_raw,
+    load_split_dataset,
     load_processor,
-    parse_boxes_from_text,
 )
 
 
@@ -30,6 +29,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Evaluate one sample with auxiliary DETR branch.")
     p.add_argument("--checkpoint-dir", required=True)
     p.add_argument("--dataset-name", default="foye501/VLM-Counting-dataset-qwenvl-sharegpt")
+    p.add_argument("--dataset-from-disk", default="")
     p.add_argument("--split", default="train")
     p.add_argument("--sample-index", type=int, default=0)
     p.add_argument("--num-queries", type=int, default=100)
@@ -69,11 +69,15 @@ def main() -> None:
     os.makedirs(os.path.dirname(args.output_image) or ".", exist_ok=True)
 
     token = args.hf_token if args.hf_token else True
-    ds = load_dataset(args.dataset_name, split=args.split, token=token)
+    ds = load_split_dataset(
+        dataset_name=args.dataset_name,
+        split=args.split,
+        token=token,
+        dataset_from_disk=args.dataset_from_disk,
+    )
     ex = ds[int(args.sample_index)]
 
-    messages = _as_messages(ex)
-    user_text, assistant_text = _extract_user_assistant(messages)
+    user_text, assistant_text = extract_user_assistant_from_example(ex)
     img = _extract_image(ex).convert("RGB")
     w, h = img.size
 
@@ -194,10 +198,11 @@ def main() -> None:
         effective_order = ckpt_order
     used_mode = inferred_mode if effective_mode == "auto" else effective_mode
     used_order = inferred_order if effective_order == "auto" else effective_order
-    gt_boxes = parse_boxes_from_text(
-        assistant_text,
+    gt_boxes = extract_gt_boxes_from_example(
+        ex,
         width=w,
         height=h,
+        assistant_text=assistant_text,
         coord_mode=effective_mode,
         coord_order=effective_order,
     )

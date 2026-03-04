@@ -13,7 +13,6 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 import torch
-from datasets import load_dataset
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
 
@@ -24,11 +23,11 @@ from qwen3_vl_det.modeling import (
     Qwen3VLAuxDetrAdapter,
 )
 from qwen3_vl_det.train_sharegpt import (
-    _as_messages,
     _extract_image,
-    _extract_user_assistant,
+    extract_gt_boxes_from_example,
+    extract_user_assistant_from_example,
+    load_split_dataset,
     load_processor,
-    parse_boxes_from_text,
     to_device,
 )
 
@@ -36,6 +35,7 @@ from qwen3_vl_det.train_sharegpt import (
 @dataclass
 class TrainAuxArgs:
     dataset_name: str = "foye501/VLM-Counting-dataset-qwenvl-sharegpt"
+    dataset_from_disk: str = ""
     train_split: str = "train"
     model_name: str = "Qwen/Qwen3-VL-2B-Instruct"
     output_dir: str = "qwen3_vl_det/checkpoints_aux"
@@ -70,6 +70,7 @@ class TrainAuxArgs:
 def parse_args() -> TrainAuxArgs:
     p = argparse.ArgumentParser(description="Qwen3-VL + auxiliary DETR finetuning on ShareGPT-style data.")
     p.add_argument("--dataset-name", default=TrainAuxArgs.dataset_name)
+    p.add_argument("--dataset-from-disk", default=TrainAuxArgs.dataset_from_disk)
     p.add_argument("--train-split", default=TrainAuxArgs.train_split)
     p.add_argument("--model-name", default=TrainAuxArgs.model_name)
     p.add_argument("--output-dir", default=TrainAuxArgs.output_dir)
@@ -132,8 +133,7 @@ class ShareGptAuxCollator:
         gt_boxes: list[torch.Tensor] = []
 
         for ex in batch:
-            messages = _as_messages(ex)
-            user_text, assistant_text = _extract_user_assistant(messages)
+            user_text, assistant_text = extract_user_assistant_from_example(ex)
             img = _extract_image(ex)
             width, height = img.size
 
@@ -160,10 +160,11 @@ class ShareGptAuxCollator:
             texts.append(chat_text)
             images.append(img)
             gt_boxes.append(
-                parse_boxes_from_text(
-                    assistant_text,
+                extract_gt_boxes_from_example(
+                    ex,
                     width=width,
                     height=height,
+                    assistant_text=assistant_text,
                     coord_mode=self.box_coord_mode,
                     coord_order=self.box_coord_order,
                 )
@@ -203,7 +204,12 @@ def main() -> None:
     torch.manual_seed(args.seed)
 
     token = args.hf_token if args.hf_token else True
-    ds = load_dataset(args.dataset_name, split=args.train_split, token=token)
+    ds = load_split_dataset(
+        dataset_name=args.dataset_name,
+        split=args.train_split,
+        token=token,
+        dataset_from_disk=args.dataset_from_disk,
+    )
     if args.max_samples > 0:
         ds = ds.select(range(min(args.max_samples, len(ds))))
     print(f"Loaded dataset: {args.dataset_name} split={args.train_split} size={len(ds)}")

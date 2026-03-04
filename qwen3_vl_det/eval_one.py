@@ -16,18 +16,18 @@ import os
 from typing import Any
 
 import torch
-from datasets import load_dataset
 from PIL import ImageDraw
 from transformers import AutoTokenizer
 
 from qwen3_vl_det.modeling import Qwen3VLDetrAdapter
 from qwen3_vl_det.train_sharegpt import (
     DET_QUERY_TOKEN,
-    _as_messages,
     _extract_image,
-    _extract_user_assistant,
+    extract_gt_boxes_from_example,
+    extract_user_assistant_from_example,
     find_query_positions,
     _infer_box_coord_order,
+    load_split_dataset,
     load_processor,
     _infer_box_coord_mode,
     extract_boxes_raw,
@@ -39,6 +39,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Evaluate one sample and save detection overlay.")
     p.add_argument("--checkpoint-dir", required=True)
     p.add_argument("--dataset-name", default="foye501/VLM-Counting-dataset-qwenvl-sharegpt")
+    p.add_argument("--dataset-from-disk", default="")
     p.add_argument("--split", default="train")
     p.add_argument("--sample-index", type=int, default=0)
     p.add_argument("--num-queries", type=int, default=32)
@@ -125,11 +126,15 @@ def main() -> None:
     os.makedirs(os.path.dirname(args.output_image) or ".", exist_ok=True)
 
     token = args.hf_token if args.hf_token else True
-    ds = load_dataset(args.dataset_name, split=args.split, token=token)
+    ds = load_split_dataset(
+        dataset_name=args.dataset_name,
+        split=args.split,
+        token=token,
+        dataset_from_disk=args.dataset_from_disk,
+    )
     ex = ds[int(args.sample_index)]
 
-    messages = _as_messages(ex)
-    user_text, assistant_text = _extract_user_assistant(messages)
+    user_text, assistant_text = extract_user_assistant_from_example(ex)
     img = _extract_image(ex).convert("RGB")
     w, h = img.size
 
@@ -261,6 +266,17 @@ def main() -> None:
         coord_mode=effective_mode,
         coord_order=effective_order,
     )
+    # If dataset already carries normalized/explicit boxes, prefer those.
+    gt_boxes_explicit = extract_gt_boxes_from_example(
+        ex,
+        width=w,
+        height=h,
+        assistant_text=assistant_text,
+        coord_mode=effective_mode,
+        coord_order=effective_order,
+    )
+    if gt_boxes_explicit.numel() > 0:
+        gt_boxes = gt_boxes_explicit
     gt_xyxy = cxcywh_to_xyxy_abs(gt_boxes, width=w, height=h)
 
     if args.debug_all_gt_parses:

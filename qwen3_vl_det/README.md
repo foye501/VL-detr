@@ -52,6 +52,37 @@ python -m qwen3_vl_det.eval_one_aux \
   --output-image qwen3_vl_det/eval_aux_sample100.png
 ```
 
+## Dataset Normalization (Recommended)
+
+Your original dataset is VLM-chat style. To avoid repeated regex parsing and
+coordinate ambiguity, normalize once to explicit fields:
+
+```bash
+python -m qwen3_vl_det.normalize_dataset \
+  --dataset-name foye501/VLM-Counting-dataset-qwenvl-sharegpt \
+  --split train \
+  --box-coord-mode norm1000 \
+  --box-coord-order yxyx \
+  --output-dir qwen3_vl_det/data_normalized/train
+```
+
+Then train/evaluate directly from disk:
+
+```bash
+python -m qwen3_vl_det.train_sharegpt_aux \
+  --dataset-from-disk qwen3_vl_det/data_normalized/train \
+  --train-split train \
+  --model-name Qwen/Qwen3-VL-2B-Instruct \
+  --require-vision \
+  --num-queries 100 \
+  --batch-size 4 \
+  --grad-accum-steps 2 \
+  --epochs 3 \
+  --lr 2e-5 \
+  --det-weight 0.3 \
+  --output-dir qwen3_vl_det/checkpoints_aux_run1
+```
+
 ## What This Adds
 
 - `modeling.py`: wrapper that adds:

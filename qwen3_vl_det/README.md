@@ -7,6 +7,51 @@ This folder gives you a practical integration path for your current Qwen3-VL res
 
 It is designed as a patch layer for your existing training code.
 
+## Auxiliary DETR Framework (No Query Prompt Tokens)
+
+If you want DETR supervision to improve the shared vision encoder but avoid any
+query-token overhead at inference, use:
+
+- `Qwen3VLAuxDetrAdapter` in `modeling.py`
+- `train_sharegpt_aux.py` for training
+- `eval_one_aux.py` for one-sample debug
+
+This setup:
+- keeps the normal Qwen3-VL generation input unchanged
+- runs a DETR branch on visual token features during training
+- allows dropping DETR at inference (`det_enabled=False`)
+
+Quick start:
+
+```bash
+python -m qwen3_vl_det.train_sharegpt_aux \
+  --model-name Qwen/Qwen3-VL-2B-Instruct \
+  --dataset-name foye501/VLM-Counting-dataset-qwenvl-sharegpt \
+  --train-split train \
+  --require-vision \
+  --num-queries 100 \
+  --batch-size 4 \
+  --grad-accum-steps 2 \
+  --epochs 3 \
+  --lr 2e-5 \
+  --lm-weight 1.0 \
+  --det-weight 0.3 \
+  --box-coord-mode norm1000 \
+  --box-coord-order yxyx \
+  --output-dir qwen3_vl_det/checkpoints_aux_run1
+```
+
+```bash
+python -m qwen3_vl_det.eval_one_aux \
+  --checkpoint-dir qwen3_vl_det/checkpoints_aux_run1/last \
+  --dataset-name foye501/VLM-Counting-dataset-qwenvl-sharegpt \
+  --sample-index 100 \
+  --box-coord-mode norm1000 \
+  --box-coord-order yxyx \
+  --obj-threshold 0.15 \
+  --output-image qwen3_vl_det/eval_aux_sample100.png
+```
+
 ## What This Adds
 
 - `modeling.py`: wrapper that adds:

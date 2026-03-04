@@ -146,6 +146,11 @@ To test whether predictions are x/y-transposed, enable:
 
 This prints normal-vs-swapped detection metrics and writes an extra overlay with swapped predictions.
 
+If GT itself looks transposed, force coordinate order explicitly:
+- `--box-coord-order yxyx`
+
+Recommendation: use the same `box_coord_mode/order` in both training and evaluation.
+
 ## Split Evaluation (ShareGPT Dataset)
 
 ```bash

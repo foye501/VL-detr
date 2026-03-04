@@ -199,19 +199,28 @@ def build_model_and_processor(args: argparse.Namespace):
     if args.require_vision and not use_vision:
         raise RuntimeError("Vision processor unavailable. Fix env and rerun with --require-vision.")
 
+    adapter_path = os.path.join(ckpt_dir, "adapter.pt")
+    adapter_state: dict[str, Any] | None = None
+    ckpt_num_queries = int(args.num_queries)
+    if os.path.exists(adapter_path):
+        adapter_state = torch.load(adapter_path, map_location="cpu")
+        if "num_queries" in adapter_state:
+            ckpt_num_queries = int(adapter_state["num_queries"])
+    if ckpt_num_queries != int(args.num_queries):
+        print(f"INFO: overriding --num-queries {args.num_queries} with checkpoint value {ckpt_num_queries}")
+    args.num_queries = ckpt_num_queries
+
     model = Qwen3VLDetrAdapter.from_pretrained(
         ckpt_dir,
         num_queries=args.num_queries,
         trust_remote_code=True,
         dtype=torch.bfloat16 if args.device.startswith("cuda") else torch.float32,
     )
-    adapter_path = os.path.join(ckpt_dir, "adapter.pt")
-    if os.path.exists(adapter_path):
-        state = torch.load(adapter_path, map_location="cpu")
-        model.load_state_dict(state["adapter_state_dict"], strict=False)
+    if adapter_state is not None:
+        model.load_state_dict(adapter_state["adapter_state_dict"], strict=False)
     model.to(args.device)
     model.eval()
-    return model, tokenizer, processor, use_vision
+    return model, tokenizer, processor, use_vision, train_args
 
 
 def main() -> None:
@@ -228,9 +237,23 @@ def main() -> None:
     end = min(len(ds), start + int(args.max_samples))
     print(f"Evaluating samples [{start}, {end}) from {args.dataset_name}/{args.split}")
 
-    model, tokenizer, processor, use_vision = build_model_and_processor(args)
+    model, tokenizer, processor, use_vision, train_args = build_model_and_processor(args)
     if not use_vision:
         print("WARNING: running without vision tensors; metrics are not valid for real detection.")
+
+    ckpt_mode = str(train_args.get("box_coord_mode", "")).lower()
+    ckpt_order = str(train_args.get("box_coord_order", "")).lower()
+    effective_mode = args.box_coord_mode
+    effective_order = args.box_coord_order
+    if effective_mode == "auto" and ckpt_mode in ("absolute", "norm1000", "norm01"):
+        effective_mode = ckpt_mode
+    if effective_order == "auto" and ckpt_order in ("xyxy", "yxyx"):
+        effective_order = ckpt_order
+    print(
+        f"Eval coord mode/order: requested=({args.box_coord_mode},{args.box_coord_order}) "
+        f"checkpoint=({ckpt_mode or 'n/a'},{ckpt_order or 'n/a'}) "
+        f"used=({effective_mode},{effective_order})"
+    )
 
     query_token_id = int(tokenizer.convert_tokens_to_ids(DET_QUERY_TOKEN))
 
@@ -294,8 +317,8 @@ def main() -> None:
             assistant_text,
             width=w,
             height=h,
-            coord_mode=args.box_coord_mode,
-            coord_order=args.box_coord_order,
+            coord_mode=effective_mode,
+            coord_order=effective_order,
         )
         gt_xyxy = cxcywh_to_xyxy_abs(gt_boxes, width=w, height=h)
 
@@ -361,6 +384,8 @@ def main() -> None:
         "iou_threshold": args.iou_threshold,
         "box_coord_mode": args.box_coord_mode,
         "box_coord_order": args.box_coord_order,
+        "box_coord_mode_used": effective_mode,
+        "box_coord_order_used": effective_order,
         "bucket_thresholds": {
             "easy_max": args.easy_max,
             "medium_max": args.medium_max,

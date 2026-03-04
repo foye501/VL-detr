@@ -161,18 +161,25 @@ def main() -> None:
     if not use_vision:
         print("WARNING: running without vision tensors; predictions are not valid for real detection quality.")
 
+    adapter_path = os.path.join(ckpt_dir, "adapter.pt")
+    adapter_state: dict[str, Any] | None = None
+    ckpt_num_queries = int(args.num_queries)
+    if os.path.exists(adapter_path):
+        adapter_state = torch.load(adapter_path, map_location="cpu")
+        if "num_queries" in adapter_state:
+            ckpt_num_queries = int(adapter_state["num_queries"])
+    if ckpt_num_queries != int(args.num_queries):
+        print(f"INFO: overriding --num-queries {args.num_queries} with checkpoint value {ckpt_num_queries}")
+    args.num_queries = ckpt_num_queries
+
     model = Qwen3VLDetrAdapter.from_pretrained(
         ckpt_dir,
         num_queries=args.num_queries,
         trust_remote_code=True,
         dtype=torch.bfloat16 if args.device.startswith("cuda") else torch.float32,
     )
-    adapter_path = os.path.join(ckpt_dir, "adapter.pt")
-    if os.path.exists(adapter_path):
-        state = torch.load(adapter_path, map_location="cpu")
-        model.load_state_dict(state["adapter_state_dict"], strict=False)
-        if "num_queries" in state:
-            args.num_queries = int(state["num_queries"])
+    if adapter_state is not None:
+        model.load_state_dict(adapter_state["adapter_state_dict"], strict=False)
     else:
         print("WARNING: adapter.pt not found; using randomly initialized adapter heads.")
 
@@ -236,14 +243,22 @@ def main() -> None:
     raw_boxes = extract_boxes_raw(assistant_text)
     inferred_mode = _infer_box_coord_mode(raw_boxes, width=w, height=h)
     inferred_order = _infer_box_coord_order(raw_boxes, width=w, height=h, mode=inferred_mode)
-    used_mode = inferred_mode if args.box_coord_mode == "auto" else args.box_coord_mode
-    used_order = inferred_order if args.box_coord_order == "auto" else args.box_coord_order
+    ckpt_mode = str(train_args.get("box_coord_mode", "")).lower()
+    ckpt_order = str(train_args.get("box_coord_order", "")).lower()
+    effective_mode = args.box_coord_mode
+    effective_order = args.box_coord_order
+    if effective_mode == "auto" and ckpt_mode in ("absolute", "norm1000", "norm01"):
+        effective_mode = ckpt_mode
+    if effective_order == "auto" and ckpt_order in ("xyxy", "yxyx"):
+        effective_order = ckpt_order
+    used_mode = inferred_mode if effective_mode == "auto" else effective_mode
+    used_order = inferred_order if effective_order == "auto" else effective_order
     gt_boxes = parse_boxes_from_text(
         assistant_text,
         width=w,
         height=h,
-        coord_mode=args.box_coord_mode,
-        coord_order=args.box_coord_order,
+        coord_mode=effective_mode,
+        coord_order=effective_order,
     )
     gt_xyxy = cxcywh_to_xyxy_abs(gt_boxes, width=w, height=h)
 
@@ -295,8 +310,14 @@ def main() -> None:
     print(f"GT count: {gt_boxes.shape[0]}")
     print(f"Pred count (@{args.obj_threshold:.2f}): {pred_boxes.shape[0]}")
     print(f"Image size: {w}x{h}")
-    print(f"Box coord mode: requested={args.box_coord_mode}, inferred={inferred_mode}, used={used_mode}")
-    print(f"Box coord order: requested={args.box_coord_order}, inferred={inferred_order}, used={used_order}")
+    print(
+        f"Box coord mode: requested={args.box_coord_mode}, checkpoint={ckpt_mode or 'n/a'}, "
+        f"inferred={inferred_mode}, used={used_mode}"
+    )
+    print(
+        f"Box coord order: requested={args.box_coord_order}, checkpoint={ckpt_order or 'n/a'}, "
+        f"inferred={inferred_order}, used={used_order}"
+    )
     if gt_boxes.numel() > 0:
         print(
             "GT box stats (norm cxcywh):",

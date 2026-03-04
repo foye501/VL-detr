@@ -141,6 +141,11 @@ python -m qwen3_vl_det.eval_one \
   --debug-prefix qwen3_vl_det/gt_parse_4000
 ```
 
+To test whether predictions are x/y-transposed, enable:
+- `--debug-pred-transpose-check`
+
+This prints normal-vs-swapped detection metrics and writes an extra overlay with swapped predictions.
+
 ## Split Evaluation (ShareGPT Dataset)
 
 ```bash

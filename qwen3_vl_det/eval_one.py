@@ -51,6 +51,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--require-vision", action="store_true")
     p.add_argument("--debug-all-gt-parses", action="store_true")
     p.add_argument("--debug-prefix", default="qwen3_vl_det/gt_parse")
+    p.add_argument("--debug-pred-transpose-check", action="store_true")
     p.add_argument("--output-image", default="qwen3_vl_det/eval_overlay.png")
     return p.parse_args()
 
@@ -73,6 +74,50 @@ def draw_boxes(img, boxes_xyxy: torch.Tensor, color: str, width: int = 3) -> Non
     draw = ImageDraw.Draw(img)
     for b in boxes_xyxy.tolist():
         draw.rectangle(b, outline=color, width=width)
+
+
+def pairwise_iou_xyxy(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    if a.numel() == 0 or b.numel() == 0:
+        return torch.zeros((a.shape[0], b.shape[0]), dtype=torch.float32)
+    lt = torch.max(a[:, None, :2], b[None, :, :2])
+    rb = torch.min(a[:, None, 2:], b[None, :, 2:])
+    wh = (rb - lt).clamp(min=0.0)
+    inter = wh[:, :, 0] * wh[:, :, 1]
+    area_a = (a[:, 2] - a[:, 0]).clamp(min=0.0) * (a[:, 3] - a[:, 1]).clamp(min=0.0)
+    area_b = (b[:, 2] - b[:, 0]).clamp(min=0.0) * (b[:, 3] - b[:, 1]).clamp(min=0.0)
+    union = area_a[:, None] + area_b[None, :] - inter
+    return inter / (union + 1e-8)
+
+
+def detection_prf(pred_xyxy: torch.Tensor, gt_xyxy: torch.Tensor, iou_thr: float = 0.5) -> tuple[float, float, float]:
+    if pred_xyxy.numel() == 0 and gt_xyxy.numel() == 0:
+        return 1.0, 1.0, 1.0
+    if pred_xyxy.numel() == 0 or gt_xyxy.numel() == 0:
+        return 0.0, 0.0, 0.0
+    iou = pairwise_iou_xyxy(pred_xyxy, gt_xyxy)
+    used_gt = set()
+    tp = 0
+    for i in range(pred_xyxy.shape[0]):
+        best_j = int(torch.argmax(iou[i]).item())
+        best_iou = float(iou[i, best_j].item())
+        if best_iou >= iou_thr and best_j not in used_gt:
+            used_gt.add(best_j)
+            tp += 1
+    fp = pred_xyxy.shape[0] - tp
+    fn = gt_xyxy.shape[0] - tp
+    p = tp / max(tp + fp, 1)
+    r = tp / max(tp + fn, 1)
+    f1 = 0.0 if (p + r) == 0 else (2 * p * r / (p + r))
+    return float(p), float(r), float(f1)
+
+
+def transpose_boxes_xy(boxes_cxcywh: torch.Tensor) -> torch.Tensor:
+    if boxes_cxcywh.numel() == 0:
+        return boxes_cxcywh
+    out = boxes_cxcywh.clone()
+    out[:, [0, 1]] = out[:, [1, 0]]
+    out[:, [2, 3]] = out[:, [3, 2]]
+    return out
 
 
 def main() -> None:
@@ -166,6 +211,10 @@ def main() -> None:
             padding=True,
         )
     inputs = {k: v.to(args.device) if torch.is_tensor(v) else v for k, v in inputs.items()}
+    if "pixel_values" in inputs and torch.is_tensor(inputs["pixel_values"]):
+        print(f"Processor pixel_values shape: {tuple(inputs['pixel_values'].shape)}")
+    if "image_grid_thw" in inputs and torch.is_tensor(inputs["image_grid_thw"]):
+        print(f"Processor image_grid_thw: {inputs['image_grid_thw'].detach().cpu().tolist()}")
     query_token_id = int(tokenizer.convert_tokens_to_ids(DET_QUERY_TOKEN))
     query_positions = find_query_positions(inputs["input_ids"], query_token_id, args.num_queries)
 
@@ -222,6 +271,25 @@ def main() -> None:
     draw_boxes(vis, gt_xyxy, color="lime", width=3)
     draw_boxes(vis, pred_xyxy, color="red", width=2)
     vis.save(args.output_image)
+
+    if args.debug_pred_transpose_check:
+        pred_boxes_t = transpose_boxes_xy(pred_boxes)
+        pred_xyxy_t = cxcywh_to_xyxy_abs(pred_boxes_t, width=w, height=h)
+        p_norm, r_norm, f_norm = detection_prf(pred_xyxy, gt_xyxy, iou_thr=0.5)
+        p_swap, r_swap, f_swap = detection_prf(pred_xyxy_t, gt_xyxy, iou_thr=0.5)
+        print(
+            "Pred transpose check @IoU0.5:",
+            {
+                "normal": {"precision": round(p_norm, 4), "recall": round(r_norm, 4), "f1": round(f_norm, 4)},
+                "xy_swapped": {"precision": round(p_swap, 4), "recall": round(r_swap, 4), "f1": round(f_swap, 4)},
+            },
+        )
+        transposed_path = args.output_image.replace(".png", "_pred_xy_swapped.png")
+        vis_t = img.copy()
+        draw_boxes(vis_t, gt_xyxy, color="lime", width=3)
+        draw_boxes(vis_t, pred_xyxy_t, color="deepskyblue", width=2)
+        vis_t.save(transposed_path)
+        print(f"Saved transposed-pred overlay: {transposed_path}")
 
     print(f"Saved overlay: {args.output_image}")
     print(f"GT count: {gt_boxes.shape[0]}")

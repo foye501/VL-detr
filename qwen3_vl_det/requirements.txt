@@ -3,3 +3,4 @@ transformers>=4.48
 scipy>=1.10
 datasets>=2.20
 pycocotools>=2.0.8
+peft>=0.12

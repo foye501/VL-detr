@@ -54,6 +54,8 @@ class AuxDetrBranchConfig:
     decoder_ffn_dim: int = 2048
     dropout: float = 0.1
     image_token_id: Optional[int] = None
+    use_grid_pos: bool = True
+    prefer_output_vision_states: bool = True
 
 
 class Qwen3VLDetrAdapter(nn.Module):
@@ -274,6 +276,11 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
         )
         self.det_decoder = nn.TransformerDecoder(decoder_layer, num_layers=self.branch_cfg.decoder_layers)
         self.det_norm = nn.LayerNorm(hidden_size)
+        self.grid_pos_mlp = nn.Sequential(
+            nn.Linear(3, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, hidden_size),
+        )
 
         self.obj_head = nn.Linear(hidden_size, 1)
         self.box_head = nn.Linear(hidden_size, 4)
@@ -281,6 +288,7 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
             nn.init.constant_(self.obj_head.bias, -2.0)
         self.hungarian_cfg = hungarian_cfg or HungarianLossConfig()
         self.loss_cfg = loss_cfg or AdapterLossConfig()
+        self._warned_visual_fallback = False
 
     @classmethod
     def from_pretrained(
@@ -368,13 +376,87 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
         best_idx = int(torch.argmax(counts).item())
         return int(uniq[best_idx].item())
 
+    @staticmethod
+    def _grid_counts_from_thw(image_grid_thw: Optional[torch.Tensor], bsz: int) -> Optional[list[int]]:
+        if image_grid_thw is None or not torch.is_tensor(image_grid_thw):
+            return None
+        if image_grid_thw.dim() != 2 or image_grid_thw.shape[-1] < 3:
+            return None
+        if image_grid_thw.shape[0] != bsz:
+            return None
+        counts: list[int] = []
+        for b in range(bsz):
+            t, h, w = [int(x) for x in image_grid_thw[b, :3].detach().cpu().tolist()]
+            counts.append(max(0, t) * max(0, h) * max(0, w))
+        return counts
+
+    def _extract_visual_memory_from_outputs(
+        self,
+        outputs: Any,
+        bsz: int,
+        hidden: int,
+        counts_from_thw: Optional[list[int]],
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+        if not self.branch_cfg.prefer_output_vision_states:
+            return None
+        candidate_attrs = (
+            "image_hidden_states",
+            "vision_hidden_states",
+            "visual_hidden_states",
+        )
+        states = None
+        for attr in candidate_attrs:
+            v = getattr(outputs, attr, None)
+            if torch.is_tensor(v):
+                states = v
+                break
+        if states is None:
+            return None
+
+        if states.dim() == 3 and states.shape[0] == bsz and states.shape[-1] == hidden:
+            memory = states
+            mask = torch.ones(memory.shape[:2], device=memory.device, dtype=torch.bool)
+            return memory, mask
+
+        if states.dim() == 2 and states.shape[-1] == hidden and counts_from_thw is not None:
+            total_needed = int(sum(counts_from_thw))
+            if total_needed <= 0 or states.shape[0] < total_needed:
+                return None
+            max_len = max(counts_from_thw) if counts_from_thw else 0
+            memory = states.new_zeros((bsz, max_len, hidden))
+            mask = torch.zeros((bsz, max_len), device=states.device, dtype=torch.bool)
+            offset = 0
+            for b, n in enumerate(counts_from_thw):
+                if n <= 0:
+                    continue
+                memory[b, :n] = states[offset : offset + n]
+                mask[b, :n] = True
+                offset += n
+            return memory, mask
+
+        return None
+
     def _extract_visual_memory(
         self,
         hidden_states: torch.Tensor,
         input_ids: torch.Tensor,
+        image_grid_thw: Optional[torch.Tensor] = None,
+        outputs: Optional[Any] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Extract per-sample visual token states using the image token id mask."""
         bsz, _, hidden = hidden_states.shape
+        counts_from_thw = self._grid_counts_from_thw(image_grid_thw=image_grid_thw, bsz=bsz)
+
+        # Prefer explicit vision states when available from the model output.
+        from_outputs = self._extract_visual_memory_from_outputs(
+            outputs=outputs,
+            bsz=bsz,
+            hidden=hidden,
+            counts_from_thw=counts_from_thw,
+        )
+        if from_outputs is not None:
+            return from_outputs
+
         image_token_id = self._infer_image_token_id(input_ids)
 
         seqs: list[torch.Tensor] = []
@@ -387,9 +469,21 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
                     "Ensure processor inserts image tokens and `image_token_id` is correct."
                 )
             states = hidden_states[b, idx]  # [Vb, H]
+            # If grid metadata is available, keep only expected number of visual tokens.
+            if counts_from_thw is not None:
+                expected = int(counts_from_thw[b])
+                if expected > 0 and states.shape[0] >= expected:
+                    states = states[:expected]
             seqs.append(states)
             if int(states.shape[0]) > max_len:
                 max_len = int(states.shape[0])
+
+        if not self._warned_visual_fallback:
+            print(
+                "WARNING: using image-token-id visual extraction fallback. "
+                "Consider setting image_token_id explicitly or using model-provided vision states."
+            )
+            self._warned_visual_fallback = True
 
         memory = hidden_states.new_zeros((bsz, max_len, hidden))
         mask = torch.zeros((bsz, max_len), device=hidden_states.device, dtype=torch.bool)
@@ -398,6 +492,41 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
             memory[b, :v] = states
             mask[b, :v] = True
         return memory, mask
+
+    def _build_grid_coord_tensor(
+        self,
+        memory: torch.Tensor,
+        memory_mask: torch.Tensor,
+        image_grid_thw: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        if not self.branch_cfg.use_grid_pos:
+            return None
+        bsz, max_len, _ = memory.shape
+        counts = self._grid_counts_from_thw(image_grid_thw=image_grid_thw, bsz=bsz)
+        if counts is None:
+            return None
+
+        coords = memory.new_zeros((bsz, max_len, 3))
+        for b in range(bsz):
+            t, h, w = [int(x) for x in image_grid_thw[b, :3].detach().cpu().tolist()]
+            if t <= 0 or h <= 0 or w <= 0:
+                continue
+            tt = torch.arange(t, device=memory.device, dtype=memory.dtype)
+            yy = torch.arange(h, device=memory.device, dtype=memory.dtype)
+            xx = torch.arange(w, device=memory.device, dtype=memory.dtype)
+            tg, yg, xg = torch.meshgrid(tt, yy, xx, indexing="ij")
+            sample_coords = torch.stack(
+                [
+                    (tg + 0.5) / float(t),
+                    (yg + 0.5) / float(h),
+                    (xg + 0.5) / float(w),
+                ],
+                dim=-1,
+            ).reshape(-1, 3)
+            n = min(int(sample_coords.shape[0]), int(memory_mask[b].sum().item()))
+            if n > 0:
+                coords[b, :n] = sample_coords[:n]
+        return coords
 
     def _decode_queries(self, memory: torch.Tensor, memory_mask: torch.Tensor) -> torch.Tensor:
         bsz = memory.shape[0]
@@ -450,7 +579,19 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
                 raise ValueError("input_ids is required for auxiliary DETR visual-token extraction.")
 
             hidden = outputs.hidden_states[-1]
-            memory, memory_mask = self._extract_visual_memory(hidden_states=hidden, input_ids=input_ids)
+            memory, memory_mask = self._extract_visual_memory(
+                hidden_states=hidden,
+                input_ids=input_ids,
+                image_grid_thw=base_inputs.get("image_grid_thw"),
+                outputs=outputs,
+            )
+            grid_coords = self._build_grid_coord_tensor(
+                memory=memory,
+                memory_mask=memory_mask,
+                image_grid_thw=base_inputs.get("image_grid_thw"),
+            )
+            if grid_coords is not None:
+                memory = memory + self.grid_pos_mlp(grid_coords.to(memory.dtype))
             query_states = self._decode_queries(memory=memory, memory_mask=memory_mask)
             obj_logits = self.obj_head(query_states).squeeze(-1)  # [B, Q]
             box_pred = torch.sigmoid(self.box_head(query_states))  # [B, Q, 4]

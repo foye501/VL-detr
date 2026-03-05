@@ -32,6 +32,13 @@ from qwen3_vl_det.train_sharegpt import (
     to_device,
 )
 
+try:
+    from peft import LoraConfig, TaskType, get_peft_model
+except Exception:  # pragma: no cover - optional dependency
+    LoraConfig = None
+    TaskType = None
+    get_peft_model = None
+
 
 @dataclass
 class TrainAuxArgs:
@@ -60,8 +67,17 @@ class TrainAuxArgs:
     log_every: int = 10
     lm_weight: float = 1.0
     det_weight: float = 0.3
+    assistant_only_loss: bool = True
     train_heads_only: bool = False
     require_vision: bool = False
+    use_lora: bool = False
+    lora_r: int = 16
+    lora_alpha: int = 32
+    lora_dropout: float = 0.05
+    lora_target_modules: str = "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj"
+    lora_modules_to_save: str = ""
+    merge_lora_on_save: bool = True
+    freeze_vision_backbone: bool = False
     box_coord_mode: str = "auto"  # auto | absolute | norm1000 | norm01
     box_coord_order: str = "auto"  # auto | xyxy | yxyx
     box_supervision_source: str = "all"  # target | all
@@ -101,8 +117,19 @@ def parse_args() -> TrainAuxArgs:
     p.add_argument("--log-every", type=int, default=TrainAuxArgs.log_every)
     p.add_argument("--lm-weight", type=float, default=TrainAuxArgs.lm_weight)
     p.add_argument("--det-weight", type=float, default=TrainAuxArgs.det_weight)
+    p.add_argument("--assistant-only-loss", dest="assistant_only_loss", action="store_true")
+    p.add_argument("--full-seq-loss", dest="assistant_only_loss", action="store_false")
     p.add_argument("--train-heads-only", action="store_true")
     p.add_argument("--require-vision", action="store_true")
+    p.add_argument("--use-lora", action="store_true")
+    p.add_argument("--lora-r", type=int, default=TrainAuxArgs.lora_r)
+    p.add_argument("--lora-alpha", type=int, default=TrainAuxArgs.lora_alpha)
+    p.add_argument("--lora-dropout", type=float, default=TrainAuxArgs.lora_dropout)
+    p.add_argument("--lora-target-modules", default=TrainAuxArgs.lora_target_modules)
+    p.add_argument("--lora-modules-to-save", default=TrainAuxArgs.lora_modules_to_save)
+    p.add_argument("--merge-lora-on-save", dest="merge_lora_on_save", action="store_true")
+    p.add_argument("--no-merge-lora-on-save", dest="merge_lora_on_save", action="store_false")
+    p.add_argument("--freeze-vision-backbone", action="store_true")
     p.add_argument(
         "--box-coord-mode",
         choices=["auto", "absolute", "norm1000", "norm01"],
@@ -121,6 +148,10 @@ def parse_args() -> TrainAuxArgs:
     p.add_argument("--seed", type=int, default=TrainAuxArgs.seed)
     p.add_argument("--hf-token", default=TrainAuxArgs.hf_token)
     p.add_argument("--device", default=TrainAuxArgs.device)
+    p.set_defaults(
+        assistant_only_loss=TrainAuxArgs.assistant_only_loss,
+        merge_lora_on_save=TrainAuxArgs.merge_lora_on_save,
+    )
     ns = p.parse_args()
     return TrainAuxArgs(**vars(ns))
 
@@ -134,6 +165,7 @@ class ShareGptAuxCollator:
         box_coord_mode: str,
         box_coord_order: str,
         box_supervision_source: str,
+        assistant_only_loss: bool,
     ) -> None:
         self.processor = processor
         self.max_length = max_length
@@ -141,9 +173,11 @@ class ShareGptAuxCollator:
         self.box_coord_mode = box_coord_mode
         self.box_coord_order = box_coord_order
         self.box_supervision_source = box_supervision_source
+        self.assistant_only_loss = assistant_only_loss
 
     def __call__(self, batch: list[dict[str, Any]]) -> dict[str, Any]:
         texts = []
+        prompt_texts = []
         images = []
         gt_boxes: list[torch.Tensor] = []
 
@@ -153,14 +187,15 @@ class ShareGptAuxCollator:
             width, height = img.size
 
             user_text = user_text.replace("<image>", "").strip()
+            user_msg = {
+                "role": "user",
+                "content": [
+                    {"type": "image"},
+                    {"type": "text", "text": user_text},
+                ],
+            }
             chat_messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image"},
-                        {"type": "text", "text": user_text},
-                    ],
-                },
+                user_msg,
                 {
                     "role": "assistant",
                     "content": [{"type": "text", "text": assistant_text}],
@@ -173,6 +208,12 @@ class ShareGptAuxCollator:
                 add_generation_prompt=False,
             )
             texts.append(chat_text)
+            prompt_text = self.processor.apply_chat_template(
+                [user_msg],
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            prompt_texts.append(prompt_text)
             images.append(img)
             gt_boxes.append(
                 extract_gt_boxes_from_example(
@@ -207,6 +248,32 @@ class ShareGptAuxCollator:
         labels = inputs["input_ids"].clone()
         if "attention_mask" in inputs:
             labels[inputs["attention_mask"] == 0] = -100
+        if self.assistant_only_loss:
+            if self.use_vision:
+                prompt_inputs = self.processor(
+                    text=prompt_texts,
+                    images=images,
+                    padding=True,
+                    truncation=True,
+                    max_length=self.max_length,
+                    return_tensors="pt",
+                )
+            else:
+                prompt_inputs = self.processor(
+                    text=prompt_texts,
+                    padding=True,
+                    truncation=True,
+                    max_length=self.max_length,
+                    return_tensors="pt",
+                )
+            if "attention_mask" in prompt_inputs:
+                prompt_lens = prompt_inputs["attention_mask"].sum(dim=1).tolist()
+            else:
+                prompt_lens = [prompt_inputs["input_ids"].shape[1]] * inputs["input_ids"].shape[0]
+            for b, p_len in enumerate(prompt_lens):
+                p_len_i = int(max(0, min(int(p_len), int(labels.shape[1]))))
+                if p_len_i > 0:
+                    labels[b, :p_len_i] = -100
 
         out = dict(inputs)
         out["labels"] = labels
@@ -258,10 +325,36 @@ def main() -> None:
     model.loss_cfg = AdapterLossConfig(lm_weight=args.lm_weight, det_weight=args.det_weight)
     model.set_objectness_bias(args.obj_bias_init)
 
+    if args.use_lora:
+        if get_peft_model is None or LoraConfig is None or TaskType is None:
+            raise RuntimeError("peft is not installed. Install `peft` to use --use-lora.")
+        target_modules = [x.strip() for x in args.lora_target_modules.split(",") if x.strip()]
+        modules_to_save = [x.strip() for x in args.lora_modules_to_save.split(",") if x.strip()]
+        lora_cfg = LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+            target_modules=target_modules,
+            modules_to_save=modules_to_save if modules_to_save else None,
+        )
+        model.base_model = get_peft_model(model.base_model, lora_cfg)
+        if hasattr(model.base_model, "print_trainable_parameters"):
+            model.base_model.print_trainable_parameters()
+        print("LoRA enabled for base model.")
+
     if args.train_heads_only:
         for p in model.base_model.parameters():
             p.requires_grad = False
         print("Training auxiliary DETR heads only.")
+    elif args.freeze_vision_backbone:
+        frozen = 0
+        for n, p in model.base_model.named_parameters():
+            lname = n.lower()
+            if ("visual" in lname) or ("vision" in lname):
+                p.requires_grad = False
+                frozen += 1
+        print(f"Froze vision/backbone params: {frozen}")
 
     model.to(args.device)
     model.train()
@@ -273,6 +366,7 @@ def main() -> None:
         box_coord_mode=args.box_coord_mode,
         box_coord_order=args.box_coord_order,
         box_supervision_source=args.box_supervision_source,
+        assistant_only_loss=args.assistant_only_loss,
     )
     loader = DataLoader(
         ds,
@@ -333,21 +427,33 @@ def main() -> None:
 
     ckpt_dir = os.path.join(args.output_dir, "last")
     os.makedirs(ckpt_dir, exist_ok=True)
-    model.base_model.save_pretrained(ckpt_dir)
+    base_to_save = model.base_model
+    if args.use_lora and args.merge_lora_on_save and hasattr(model.base_model, "merge_and_unload"):
+        print("Merging LoRA weights into base model for checkpoint export...")
+        base_to_save = model.base_model.merge_and_unload()
+        model.base_model = base_to_save
+    base_to_save.save_pretrained(ckpt_dir)
     tokenizer.save_pretrained(ckpt_dir)
     if use_vision:
         try:
             processor.save_pretrained(ckpt_dir)
         except Exception as e:
             print(f"WARNING: failed to save processor: {type(e).__name__}: {e}")
+    aux_only_state = {
+        k: v
+        for k, v in model.state_dict().items()
+        if not k.startswith("base_model.")
+    }
     torch.save(
         {
             "adapter_type": "aux_visual",
-            "adapter_state_dict": model.state_dict(),
+            "adapter_state_dict": aux_only_state,
             "num_queries": args.num_queries,
             "branch_cfg": asdict(model.branch_cfg),
             "hungarian_cfg": asdict(model.hungarian_cfg),
             "loss_cfg": asdict(model.loss_cfg),
+            "assistant_only_loss": bool(args.assistant_only_loss),
+            "use_lora": bool(args.use_lora),
         },
         os.path.join(ckpt_dir, "adapter.pt"),
     )

@@ -30,6 +30,11 @@ DET_WEIGHT="${DET_WEIGHT:-0.3}"
 BOX_MODE="${BOX_MODE:-norm1000}"
 BOX_ORDER="${BOX_ORDER:-yxyx}"
 OBJ_THRESHOLD="${OBJ_THRESHOLD:-0.35}"
+USE_LORA="${USE_LORA:-1}"
+LORA_R="${LORA_R:-16}"
+LORA_ALPHA="${LORA_ALPHA:-32}"
+LORA_DROPOUT="${LORA_DROPOUT:-0.05}"
+ASSISTANT_ONLY_LOSS="${ASSISTANT_ONLY_LOSS:-1}"
 START_INDEX="${START_INDEX:-0}"
 MAX_SAMPLES="${MAX_SAMPLES:-1000}"
 SAMPLE_INDEX="${SAMPLE_INDEX:-100}"
@@ -57,6 +62,14 @@ if [[ -n "${DATASET_FROM_DISK}" ]]; then
   train_cmd+=(--dataset-from-disk "${DATASET_FROM_DISK}")
 else
   train_cmd+=(--dataset-name "${DATASET_NAME}")
+fi
+if [[ "${USE_LORA}" == "1" ]]; then
+  train_cmd+=(--use-lora --lora-r "${LORA_R}" --lora-alpha "${LORA_ALPHA}" --lora-dropout "${LORA_DROPOUT}")
+fi
+if [[ "${ASSISTANT_ONLY_LOSS}" == "1" ]]; then
+  train_cmd+=(--assistant-only-loss)
+else
+  train_cmd+=(--full-seq-loss)
 fi
 
 echo "== Training =="

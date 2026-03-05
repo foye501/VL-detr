@@ -20,6 +20,8 @@ This setup:
 - keeps the normal Qwen3-VL generation input unchanged
 - runs a DETR branch on visual token features during training
 - allows dropping DETR at inference (`det_enabled=False`)
+- supports LoRA fine-tuning to avoid full 2B-parameter updates
+- supports assistant-only LM masking to prevent prompt-loss domination
 
 Quick start:
 
@@ -29,6 +31,8 @@ python -m qwen3_vl_det.train_sharegpt_aux \
   --dataset-name foye501/VLM-Counting-dataset-qwenvl-sharegpt \
   --train-split train \
   --require-vision \
+  --use-lora \
+  --assistant-only-loss \
   --num-queries 100 \
   --batch-size 4 \
   --grad-accum-steps 2 \
@@ -75,6 +79,8 @@ python -m qwen3_vl_det.train_sharegpt_aux \
   --train-split train \
   --model-name Qwen/Qwen3-VL-2B-Instruct \
   --require-vision \
+  --use-lora \
+  --assistant-only-loss \
   --num-queries 100 \
   --batch-size 4 \
   --grad-accum-steps 2 \
@@ -115,6 +121,8 @@ python -m qwen3_vl_det.train_sharegpt_aux \
   --dataset-from-disk qwen3_vl_det/data_synth_v2/train \
   --model-name Qwen/Qwen3-VL-2B-Instruct \
   --require-vision \
+  --use-lora \
+  --assistant-only-loss \
   --box-supervision-source all \
   --box-coord-mode norm1000 \
   --box-coord-order yxyx \
@@ -169,6 +177,9 @@ bash qwen3_vl_det/run_experiment_aux.sh
 
 - `query_positions` must be exact token positions for query markers in each sample.
 - `gt_boxes` must be normalized to `[0,1]` in `cx, cy, w, h`.
+- `train_sharegpt_aux.py` supports:
+  - `--use-lora` (recommended to preserve base capability)
+  - `--assistant-only-loss` (default behavior; use `--full-seq-loss` to disable)
 - Supervision source can be selected with `--box-supervision-source`:
   - `target`: only objects matching the question target
   - `all`: target + distractors (recommended for auxiliary DETR branch)

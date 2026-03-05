@@ -161,6 +161,8 @@ bash qwen3_vl_det/run_experiment_aux.sh
 - Hungarian cost: `class=1.0`, `bbox=5.0`, `giou=2.0`
 - No-object weight: `0.5`
 - Count regularization: `count_loss_weight=0.5`
+  - By default, count loss is computed on raw counts (not divided by `num_queries`).
+  - Use `--count-loss-normalize-by-queries` to restore old normalized behavior.
 - Objectness prior bias: `obj_bias_init=-2.0`
 
 ## Important Notes

@@ -20,6 +20,7 @@ class HungarianLossConfig:
     giou_loss_weight: float = 2.0
     obj_loss_weight: float = 1.0
     count_loss_weight: float = 0.5
+    count_loss_normalize_by_queries: bool = False
 
 
 def box_cxcywh_to_xyxy(boxes: torch.Tensor) -> torch.Tensor:
@@ -161,10 +162,13 @@ def detr_hungarian_loss(
         device=device,
         dtype=pred_obj_logits.dtype,
     )
-    count_loss = F.l1_loss(
-        pred_count / float(num_queries),
-        gt_count / float(num_queries),
-    )
+    if cfg.count_loss_normalize_by_queries:
+        count_loss = F.l1_loss(
+            pred_count / float(num_queries),
+            gt_count / float(num_queries),
+        )
+    else:
+        count_loss = F.l1_loss(pred_count, gt_count)
 
     if all_box_l1:
         box_l1 = torch.cat(all_box_l1).mean()

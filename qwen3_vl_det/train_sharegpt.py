@@ -64,6 +64,7 @@ class TrainArgs:
     giou_cost: float = 2.0
     no_object_weight: float = 0.5
     count_loss_weight: float = 0.5
+    count_loss_normalize_by_queries: bool = False
     obj_bias_init: float = -2.0
     grad_clip_norm: float = 1.0
     max_length: int = 2048
@@ -99,6 +100,11 @@ def parse_args() -> TrainArgs:
     p.add_argument("--giou-cost", type=float, default=TrainArgs.giou_cost)
     p.add_argument("--no-object-weight", type=float, default=TrainArgs.no_object_weight)
     p.add_argument("--count-loss-weight", type=float, default=TrainArgs.count_loss_weight)
+    p.add_argument(
+        "--count-loss-normalize-by-queries",
+        action="store_true",
+        default=TrainArgs.count_loss_normalize_by_queries,
+    )
     p.add_argument("--obj-bias-init", type=float, default=TrainArgs.obj_bias_init)
     p.add_argument("--grad-clip-norm", type=float, default=TrainArgs.grad_clip_norm)
     p.add_argument("--max-length", type=int, default=TrainArgs.max_length)
@@ -855,6 +861,7 @@ def main() -> None:
         giou_cost=args.giou_cost,
         no_object_weight=args.no_object_weight,
         count_loss_weight=args.count_loss_weight,
+        count_loss_normalize_by_queries=args.count_loss_normalize_by_queries,
     )
     model.loss_cfg = AdapterLossConfig(lm_weight=args.lm_weight, det_weight=args.det_weight)
     model.set_objectness_bias(args.obj_bias_init)

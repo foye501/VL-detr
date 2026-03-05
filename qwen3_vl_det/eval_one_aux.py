@@ -14,6 +14,7 @@ from transformers import AutoTokenizer
 
 from qwen3_vl_det.modeling import AuxDetrBranchConfig, Qwen3VLAuxDetrAdapter
 from qwen3_vl_det.train_sharegpt import (
+    BOX_SUPERVISION_CHOICES,
     _extract_image,
     extract_gt_boxes_from_example,
     extract_user_assistant_from_example,
@@ -36,6 +37,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--obj-threshold", type=float, default=0.5)
     p.add_argument("--box-coord-mode", choices=["auto", "absolute", "norm1000", "norm01"], default="auto")
     p.add_argument("--box-coord-order", choices=["auto", "xyxy", "yxyx"], default="auto")
+    p.add_argument(
+        "--box-supervision-source",
+        choices=list(BOX_SUPERVISION_CHOICES),
+        default="all",
+    )
     p.add_argument("--model-name", default="")
     p.add_argument("--hf-token", default="")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -190,12 +196,16 @@ def main() -> None:
     inferred_order = _infer_box_coord_order(raw_boxes, width=w, height=h, mode=inferred_mode)
     ckpt_mode = str(train_args.get("box_coord_mode", "")).lower()
     ckpt_order = str(train_args.get("box_coord_order", "")).lower()
+    ckpt_source = str(train_args.get("box_supervision_source", "")).lower()
     effective_mode = args.box_coord_mode
     effective_order = args.box_coord_order
+    effective_source = args.box_supervision_source
     if effective_mode == "auto" and ckpt_mode in ("absolute", "norm1000", "norm01"):
         effective_mode = ckpt_mode
     if effective_order == "auto" and ckpt_order in ("xyxy", "yxyx"):
         effective_order = ckpt_order
+    if args.box_supervision_source == "all" and ckpt_source in BOX_SUPERVISION_CHOICES:
+        effective_source = ckpt_source
     used_mode = inferred_mode if effective_mode == "auto" else effective_mode
     used_order = inferred_order if effective_order == "auto" else effective_order
     gt_boxes = extract_gt_boxes_from_example(
@@ -205,6 +215,7 @@ def main() -> None:
         assistant_text=assistant_text,
         coord_mode=effective_mode,
         coord_order=effective_order,
+        box_supervision_source=effective_source,
     )
     gt_xyxy = cxcywh_to_xyxy_abs(gt_boxes, width=w, height=h)
 
@@ -225,6 +236,10 @@ def main() -> None:
     print(
         f"Box coord order: requested={args.box_coord_order}, checkpoint={ckpt_order or 'n/a'}, "
         f"inferred={inferred_order}, used={used_order}"
+    )
+    print(
+        f"Box supervision source: requested={args.box_supervision_source}, "
+        f"checkpoint={ckpt_source or 'n/a'}, used={effective_source}"
     )
     if gt_boxes.numel() > 0:
         print(

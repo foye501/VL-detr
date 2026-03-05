@@ -1,21 +1,12 @@
-"""Evaluate a checkpoint on ShareGPT-style counting data.
+"""Evaluate auxiliary-branch checkpoints on ShareGPT-style counting data.
 
 Reports:
 - count MAE
 - count exact accuracy
 - detection precision/recall/F1 at IoU threshold
 
-Example:
-  python -m qwen3_vl_det.eval_split \
-    --checkpoint-dir qwen3_vl_det/checkpoints_run2/last \
-    --dataset-name foye501/VLM-Counting-dataset-qwenvl-sharegpt \
-    --split train \
-    --start-index 9000 \
-    --max-samples 500 \
-    --num-queries 32 \
-    --obj-threshold 0.5 \
-    --require-vision \
-    --output-json qwen3_vl_det/eval_sharegpt_run2.json
+Unlike eval_split.py (query-token branch), this uses Qwen3VLAuxDetrAdapter and
+does not inject DET query tokens into the prompt.
 """
 
 from __future__ import annotations
@@ -30,13 +21,12 @@ import torch
 from PIL import ImageDraw
 from transformers import AutoTokenizer
 
-from qwen3_vl_det.modeling import Qwen3VLDetrAdapter
+from qwen3_vl_det.modeling import AuxDetrBranchConfig, Qwen3VLAuxDetrAdapter
 from qwen3_vl_det.train_sharegpt import (
-    DET_QUERY_TOKEN,
+    BOX_SUPERVISION_CHOICES,
     _extract_image,
     extract_gt_boxes_from_example,
     extract_user_assistant_from_example,
-    find_query_positions,
     load_split_dataset,
     load_processor,
 )
@@ -56,18 +46,23 @@ class EvalRow:
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Evaluate ShareGPT-style counting dataset.")
+    p = argparse.ArgumentParser(description="Evaluate auxiliary DETR checkpoint on ShareGPT-style data.")
     p.add_argument("--checkpoint-dir", required=True)
     p.add_argument("--dataset-name", default="foye501/VLM-Counting-dataset-qwenvl-sharegpt")
     p.add_argument("--dataset-from-disk", default="")
     p.add_argument("--split", default="train")
     p.add_argument("--start-index", type=int, default=0)
     p.add_argument("--max-samples", type=int, default=500)
-    p.add_argument("--num-queries", type=int, default=32)
-    p.add_argument("--obj-threshold", type=float, default=0.5)
+    p.add_argument("--num-queries", type=int, default=100)
+    p.add_argument("--obj-threshold", type=float, default=0.35)
     p.add_argument("--iou-threshold", type=float, default=0.5)
     p.add_argument("--box-coord-mode", choices=["auto", "absolute", "norm1000", "norm01"], default="auto")
     p.add_argument("--box-coord-order", choices=["auto", "xyxy", "yxyx"], default="auto")
+    p.add_argument(
+        "--box-supervision-source",
+        choices=list(BOX_SUPERVISION_CHOICES),
+        default="all",
+    )
     p.add_argument("--easy-max", type=int, default=5)
     p.add_argument("--medium-max", type=int, default=20)
     p.add_argument("--hard-max", type=int, default=50)
@@ -76,9 +71,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--require-vision", action="store_true")
     p.add_argument("--save-overlays", action="store_true")
-    p.add_argument("--overlay-dir", default="qwen3_vl_det/eval_overlays")
+    p.add_argument("--overlay-dir", default="qwen3_vl_det/eval_aux_overlays")
     p.add_argument("--overlay-every", type=int, default=50)
-    p.add_argument("--output-json", default="qwen3_vl_det/eval_sharegpt.json")
+    p.add_argument("--output-json", default="qwen3_vl_det/eval_sharegpt_aux.json")
     return p.parse_args()
 
 
@@ -188,9 +183,6 @@ def build_model_and_processor(args: argparse.Namespace):
     if not tokenizer_path:
         raise ValueError("Tokenizer not found in checkpoint; provide --model-name.")
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
-    det_query_id = tokenizer.convert_tokens_to_ids(DET_QUERY_TOKEN)
-    if det_query_id is None or int(det_query_id) < 0:
-        tokenizer.add_special_tokens({"additional_special_tokens": [DET_QUERY_TOKEN]})
 
     if args.model_name:
         processor_model = args.model_name
@@ -207,17 +199,21 @@ def build_model_and_processor(args: argparse.Namespace):
     adapter_path = os.path.join(ckpt_dir, "adapter.pt")
     adapter_state: dict[str, Any] | None = None
     ckpt_num_queries = int(args.num_queries)
+    branch_cfg = AuxDetrBranchConfig()
     if os.path.exists(adapter_path):
         adapter_state = torch.load(adapter_path, map_location="cpu")
         if "num_queries" in adapter_state:
             ckpt_num_queries = int(adapter_state["num_queries"])
+        if "branch_cfg" in adapter_state and isinstance(adapter_state["branch_cfg"], dict):
+            branch_cfg = AuxDetrBranchConfig(**adapter_state["branch_cfg"])
     if ckpt_num_queries != int(args.num_queries):
         print(f"INFO: overriding --num-queries {args.num_queries} with checkpoint value {ckpt_num_queries}")
     args.num_queries = ckpt_num_queries
 
-    model = Qwen3VLDetrAdapter.from_pretrained(
+    model = Qwen3VLAuxDetrAdapter.from_pretrained(
         ckpt_dir,
         num_queries=args.num_queries,
+        branch_cfg=branch_cfg,
         trust_remote_code=True,
         dtype=torch.bfloat16 if args.device.startswith("cuda") else torch.float32,
     )
@@ -253,25 +249,22 @@ def main() -> None:
 
     ckpt_mode = str(train_args.get("box_coord_mode", "")).lower()
     ckpt_order = str(train_args.get("box_coord_order", "")).lower()
+    ckpt_source = str(train_args.get("box_supervision_source", "")).lower()
     effective_mode = args.box_coord_mode
     effective_order = args.box_coord_order
+    effective_source = args.box_supervision_source
     if effective_mode == "auto" and ckpt_mode in ("absolute", "norm1000", "norm01"):
         effective_mode = ckpt_mode
     if effective_order == "auto" and ckpt_order in ("xyxy", "yxyx"):
         effective_order = ckpt_order
+    if args.box_supervision_source == "all" and ckpt_source in BOX_SUPERVISION_CHOICES:
+        # Mirror train-time default unless user explicitly overrides.
+        effective_source = ckpt_source
     print(
-        f"Eval coord mode/order: requested=({args.box_coord_mode},{args.box_coord_order}) "
-        f"checkpoint=({ckpt_mode or 'n/a'},{ckpt_order or 'n/a'}) "
-        f"used=({effective_mode},{effective_order})"
+        f"Eval coord mode/order/source: requested=({args.box_coord_mode},{args.box_coord_order},{args.box_supervision_source}) "
+        f"checkpoint=({ckpt_mode or 'n/a'},{ckpt_order or 'n/a'},{ckpt_source or 'n/a'}) "
+        f"used=({effective_mode},{effective_order},{effective_source})"
     )
-
-    query_token_id = tokenizer.convert_tokens_to_ids(DET_QUERY_TOKEN)
-    if query_token_id is None or int(query_token_id) < 0:
-        raise RuntimeError(
-            f"{DET_QUERY_TOKEN} token id missing after tokenizer setup. "
-            "Check tokenizer files in checkpoint."
-        )
-    query_token_id = int(query_token_id)
 
     rows: list[EvalRow] = []
     for idx in range(start, end):
@@ -281,8 +274,6 @@ def main() -> None:
         w, h = img.size
 
         user_text = user_text.replace("<image>", "").strip()
-        query_text = " ".join([DET_QUERY_TOKEN] * args.num_queries)
-        user_text = f"{user_text}\n{query_text}"
         chat_messages = [
             {
                 "role": "user",
@@ -297,6 +288,7 @@ def main() -> None:
             tokenize=False,
             add_generation_prompt=True,
         )
+
         if use_vision:
             inputs = processor(
                 text=[chat_text],
@@ -311,7 +303,6 @@ def main() -> None:
                 padding=True,
             )
         inputs = {k: v.to(args.device) if torch.is_tensor(v) else v for k, v in inputs.items()}
-        query_positions = find_query_positions(inputs["input_ids"], query_token_id, args.num_queries)
 
         with torch.no_grad():
             out = model(
@@ -319,7 +310,8 @@ def main() -> None:
                 attention_mask=inputs.get("attention_mask"),
                 pixel_values=inputs.get("pixel_values"),
                 image_grid_thw=inputs.get("image_grid_thw"),
-                query_positions=query_positions,
+                det_enabled=True,
+                return_det=True,
             )
             obj_prob = out["det_obj_logits"].sigmoid()[0]
             box_pred = out["det_boxes"][0]
@@ -336,6 +328,7 @@ def main() -> None:
             assistant_text=assistant_text,
             coord_mode=effective_mode,
             coord_order=effective_order,
+            box_supervision_source=effective_source,
         )
         gt_xyxy = cxcywh_to_xyxy_abs(gt_boxes, width=w, height=h)
 
@@ -402,8 +395,10 @@ def main() -> None:
         "iou_threshold": args.iou_threshold,
         "box_coord_mode": args.box_coord_mode,
         "box_coord_order": args.box_coord_order,
+        "box_supervision_source": args.box_supervision_source,
         "box_coord_mode_used": effective_mode,
         "box_coord_order_used": effective_order,
+        "box_supervision_source_used": effective_source,
         "bucket_thresholds": {
             "easy_max": args.easy_max,
             "medium_max": args.medium_max,

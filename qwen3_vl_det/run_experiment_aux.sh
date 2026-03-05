@@ -68,7 +68,7 @@ eval_json="${OUTPUT_DIR}/eval_split.json"
 overlay_dir="${OUTPUT_DIR}/eval_overlays"
 
 eval_cmd=(
-  python -m qwen3_vl_det.eval_split
+  python -m qwen3_vl_det.eval_split_aux
   --checkpoint-dir "${OUTPUT_DIR}/last"
   --split "${SPLIT}"
   --start-index "${START_INDEX}"
@@ -77,6 +77,7 @@ eval_cmd=(
   --obj-threshold "${OBJ_THRESHOLD}"
   --box-coord-mode "${BOX_MODE}"
   --box-coord-order "${BOX_ORDER}"
+  --box-supervision-source all
   --require-vision
   --output-json "${eval_json}"
   --save-overlays

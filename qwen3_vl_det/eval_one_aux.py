@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 from dataclasses import asdict
 from typing import Any
 
@@ -21,6 +22,7 @@ from qwen3_vl_det.train_sharegpt import (
     _infer_box_coord_mode,
     _infer_box_coord_order,
     extract_boxes_raw,
+    parse_boxes_from_text,
     load_split_dataset,
     load_processor,
 )
@@ -50,6 +52,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output-json", default="")
     p.add_argument("--print-topk", type=int, default=20)
     p.add_argument("--annotate-scores", action="store_true")
+    p.add_argument("--lm-max-new-tokens", type=int, default=256)
+    p.add_argument("--eval-lm-generation", dest="eval_lm_generation", action="store_true")
+    p.add_argument("--no-eval-lm-generation", dest="eval_lm_generation", action="store_false")
+    p.set_defaults(eval_lm_generation=True)
     return p.parse_args()
 
 
@@ -93,6 +99,27 @@ def _round4(v: float) -> float:
     return round(float(v), 4)
 
 
+def extract_count_from_text(text: str) -> int | None:
+    patterns = [
+        r"total\s*count\s*[:=]\s*(-?\d+)",
+        r"count\s*[:=]\s*(-?\d+)",
+    ]
+    for pat in patterns:
+        m = re.search(pat, text, flags=re.IGNORECASE)
+        if m:
+            try:
+                return int(m.group(1))
+            except Exception:
+                pass
+    nums = re.findall(r"(?<![\d.])-?\d+(?![\d.])", text)
+    if len(nums) == 1:
+        try:
+            return int(nums[0])
+        except Exception:
+            return None
+    return None
+
+
 def _derive_path(base_path: str, suffix: str) -> str:
     root, ext = os.path.splitext(base_path)
     if not ext:
@@ -114,6 +141,26 @@ def build_comparison_strip(
     draw.text((8, 4), "GT", fill="black")
     draw.text((w + 8, 4), "Pred", fill="black")
     draw.text((2 * w + 8, 4), "Overlay", fill="black")
+    return out
+
+
+def build_four_panel_strip(
+    gt_img: Image.Image,
+    det_img: Image.Image,
+    lm_img: Image.Image,
+    overlay_img: Image.Image,
+) -> Image.Image:
+    w, h = gt_img.size
+    out = Image.new("RGB", (w * 4, h + 22), color=(255, 255, 255))
+    out.paste(gt_img, (0, 22))
+    out.paste(det_img, (w, 22))
+    out.paste(lm_img, (2 * w, 22))
+    out.paste(overlay_img, (3 * w, 22))
+    draw = ImageDraw.Draw(out)
+    draw.text((8, 4), "GT", fill="black")
+    draw.text((w + 8, 4), "DETR", fill="black")
+    draw.text((2 * w + 8, 4), "LM boxes", fill="black")
+    draw.text((3 * w + 8, 4), "All", fill="black")
     return out
 
 
@@ -233,6 +280,41 @@ def main() -> None:
         obj_prob = out["det_obj_logits"].sigmoid()[0]
         box_pred = out["det_boxes"][0]
 
+    lm_generated_text = ""
+    lm_count_text: int | None = None
+    lm_boxes = torch.zeros((0, 4), dtype=torch.float32)
+    lm_xyxy = torch.zeros((0, 4), dtype=torch.float32)
+    if args.eval_lm_generation:
+        gen_kwargs = {
+            "input_ids": inputs["input_ids"],
+            "attention_mask": inputs.get("attention_mask"),
+            "max_new_tokens": int(args.lm_max_new_tokens),
+            "do_sample": False,
+        }
+        if "pixel_values" in inputs:
+            gen_kwargs["pixel_values"] = inputs.get("pixel_values")
+        if "image_grid_thw" in inputs:
+            gen_kwargs["image_grid_thw"] = inputs.get("image_grid_thw")
+        with torch.no_grad():
+            gen_ids = model.base_model.generate(**gen_kwargs)
+        gen_trimmed = [
+            out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs["input_ids"], gen_ids)
+        ]
+        lm_generated_text = processor.batch_decode(
+            gen_trimmed,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )[0]
+        lm_count_text = extract_count_from_text(lm_generated_text)
+        lm_boxes = parse_boxes_from_text(
+            lm_generated_text,
+            width=w,
+            height=h,
+            coord_mode="auto",
+            coord_order="auto",
+        )
+        lm_xyxy = cxcywh_to_xyxy_abs(lm_boxes, width=w, height=h)
+
     keep = obj_prob >= args.obj_threshold
     pred_boxes = box_pred[keep].detach().cpu()
     pred_scores = obj_prob[keep].detach().cpu()
@@ -283,6 +365,9 @@ def main() -> None:
     else:
         draw_boxes(vis_pred, pred_xyxy, color="red", width=2)  # Pred
 
+    vis_lm = img.copy()
+    draw_boxes(vis_lm, lm_xyxy, color="dodgerblue", width=2)  # LM parsed boxes
+
     vis_overlay = img.copy()
     draw_boxes(vis_overlay, gt_xyxy, color="lime", width=3)  # GT
     if args.annotate_scores and pred_xyxy.numel() > 0:
@@ -290,15 +375,21 @@ def main() -> None:
         draw_labeled_boxes(vis_overlay, pred_xyxy, labels=labels, color="red", width=2)
     else:
         draw_boxes(vis_overlay, pred_xyxy, color="red", width=2)  # Pred
+    draw_boxes(vis_overlay, lm_xyxy, color="dodgerblue", width=2)  # LM boxes
 
     gt_image_path = _derive_path(args.output_image, "gt")
     pred_image_path = _derive_path(args.output_image, "pred")
+    lm_image_path = _derive_path(args.output_image, "lm")
     compare_image_path = _derive_path(args.output_image, "compare")
+    compare4_image_path = _derive_path(args.output_image, "compare4")
     vis_gt.save(gt_image_path)
     vis_pred.save(pred_image_path)
+    vis_lm.save(lm_image_path)
     vis_overlay.save(args.output_image)
     compare = build_comparison_strip(vis_gt, vis_pred, vis_overlay)
     compare.save(compare_image_path)
+    compare4 = build_four_panel_strip(vis_gt, vis_pred, vis_lm, vis_overlay)
+    compare4.save(compare4_image_path)
 
     pred_items = []
     for i in range(int(pred_boxes.shape[0])):
@@ -344,12 +435,27 @@ def main() -> None:
         "threshold": float(args.obj_threshold),
         "counts": {
             "gt_count": int(gt_boxes.shape[0]),
-            "pred_count_thresholded": int(pred_boxes.shape[0]),
-            "pred_soft_count": _round4(soft_count),
+            "pred_count_thresholded_detr": int(pred_boxes.shape[0]),
+            "pred_soft_count_detr": _round4(soft_count),
+            "pred_count_lm_text": int(lm_count_text) if lm_count_text is not None else None,
+            "pred_count_lm_boxes": int(lm_boxes.shape[0]),
         },
         "gt_boxes": gt_items,
-        "pred_boxes_thresholded": pred_items,
-        "pred_topk_queries": top_items,
+        "pred_boxes_thresholded_detr": pred_items,
+        "pred_topk_queries_detr": top_items,
+        "pred_boxes_lm_generation": [
+            {
+                "rank": i,
+                "cxcywh_norm": [_round4(v) for v in lm_boxes[i].tolist()],
+                "xyxy_abs": [_round4(v) for v in lm_xyxy[i].tolist()],
+            }
+            for i in range(int(lm_boxes.shape[0]))
+        ],
+        "lm_generation": {
+            "enabled": bool(args.eval_lm_generation),
+            "max_new_tokens": int(args.lm_max_new_tokens),
+            "text": lm_generated_text,
+        },
         "settings": {
             "box_coord_mode_used": used_mode,
             "box_coord_order_used": used_order,
@@ -362,11 +468,15 @@ def main() -> None:
     print(f"Saved overlay: {args.output_image}")
     print(f"Saved GT-only: {gt_image_path}")
     print(f"Saved Pred-only: {pred_image_path}")
+    print(f"Saved LM-only: {lm_image_path}")
     print(f"Saved side-by-side compare: {compare_image_path}")
+    print(f"Saved 4-panel compare: {compare4_image_path}")
     print(f"Saved prediction json: {out_json}")
     print(f"GT count: {gt_boxes.shape[0]}")
-    print(f"Pred count (@{args.obj_threshold:.2f}): {pred_boxes.shape[0]}")
-    print(f"Pred soft count (sum probs): {soft_count:.2f}")
+    print(f"Pred count DETR (@{args.obj_threshold:.2f}): {pred_boxes.shape[0]}")
+    print(f"Pred soft count DETR (sum probs): {soft_count:.2f}")
+    print(f"Pred count LM text: {lm_count_text if lm_count_text is not None else 'n/a'}")
+    print(f"Pred count LM parsed boxes: {int(lm_boxes.shape[0])}")
     print(f"Image size: {w}x{h}")
     print(
         f"Box coord mode: requested={args.box_coord_mode}, checkpoint={ckpt_mode or 'n/a'}, "
@@ -411,6 +521,9 @@ def main() -> None:
         print("Det stats:", json.dumps(out["det_stats"], indent=2))
     if "lm_loss" in out:
         print(f"LM loss (for this sample prompt): {float(out['lm_loss'].detach().cpu()):.4f}")
+    if args.eval_lm_generation:
+        print("LM generated text:")
+        print(lm_generated_text)
     print("Branch cfg:", json.dumps(asdict(branch_cfg), indent=2))
 
 

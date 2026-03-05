@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 from dataclasses import asdict, dataclass
 from typing import Any
 
@@ -27,6 +28,7 @@ from qwen3_vl_det.train_sharegpt import (
     _extract_image,
     extract_gt_boxes_from_example,
     extract_user_assistant_from_example,
+    parse_boxes_from_text,
     load_split_dataset,
     load_processor,
 )
@@ -36,12 +38,19 @@ from qwen3_vl_det.train_sharegpt import (
 class EvalRow:
     index: int
     gt_count: int
-    pred_count: int
-    pred_count_soft: float
-    abs_error: int
-    precision: float
-    recall: float
-    f1: float
+    pred_count_detr: int
+    pred_count_soft_detr: float
+    abs_error_detr: int
+    precision_detr: float
+    recall_detr: float
+    f1_detr: float
+    pred_count_lm_text: int | None
+    abs_error_lm_text: int | None
+    pred_count_lm_boxes: int
+    abs_error_lm_boxes: int
+    precision_lm_boxes: float
+    recall_lm_boxes: float
+    f1_lm_boxes: float
     bucket: str
 
 
@@ -73,7 +82,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--save-overlays", action="store_true")
     p.add_argument("--overlay-dir", default="qwen3_vl_det/eval_aux_overlays")
     p.add_argument("--overlay-every", type=int, default=50)
+    p.add_argument("--lm-max-new-tokens", type=int, default=256)
+    p.add_argument("--eval-lm-generation", dest="eval_lm_generation", action="store_true")
+    p.add_argument("--no-eval-lm-generation", dest="eval_lm_generation", action="store_false")
     p.add_argument("--output-json", default="qwen3_vl_det/eval_sharegpt_aux.json")
+    p.set_defaults(eval_lm_generation=True)
     return p.parse_args()
 
 
@@ -87,7 +100,7 @@ def bucket_from_gt_count(gt_count: int, easy_max: int, medium_max: int, hard_max
     return "extreme"
 
 
-def aggregate_metrics(rows: list[EvalRow]) -> dict[str, float]:
+def aggregate_det_metrics(rows: list[EvalRow]) -> dict[str, float]:
     if not rows:
         return {
             "count_mae": 0.0,
@@ -97,12 +110,12 @@ def aggregate_metrics(rows: list[EvalRow]) -> dict[str, float]:
             "recall": 0.0,
             "f1": 0.0,
         }
-    count_mae = sum(r.abs_error for r in rows) / len(rows)
-    count_soft_mae = sum(abs(r.pred_count_soft - r.gt_count) for r in rows) / len(rows)
-    count_acc = sum(1.0 for r in rows if r.abs_error == 0) / len(rows)
-    precision = sum(r.precision for r in rows) / len(rows)
-    recall = sum(r.recall for r in rows) / len(rows)
-    f1 = sum(r.f1 for r in rows) / len(rows)
+    count_mae = sum(r.abs_error_detr for r in rows) / len(rows)
+    count_soft_mae = sum(abs(r.pred_count_soft_detr - r.gt_count) for r in rows) / len(rows)
+    count_acc = sum(1.0 for r in rows if r.abs_error_detr == 0) / len(rows)
+    precision = sum(r.precision_detr for r in rows) / len(rows)
+    recall = sum(r.recall_detr for r in rows) / len(rows)
+    f1 = sum(r.f1_detr for r in rows) / len(rows)
     return {
         "count_mae": count_mae,
         "count_soft_mae": count_soft_mae,
@@ -111,6 +124,77 @@ def aggregate_metrics(rows: list[EvalRow]) -> dict[str, float]:
         "recall": recall,
         "f1": f1,
     }
+
+
+def aggregate_lm_text_metrics(rows: list[EvalRow]) -> dict[str, float | int]:
+    total = len(rows)
+    valid = [r for r in rows if r.abs_error_lm_text is not None]
+    if total == 0:
+        return {
+            "count_mae": 0.0,
+            "count_accuracy": 0.0,
+            "parse_rate": 0.0,
+            "num_parsed": 0,
+        }
+    if not valid:
+        return {
+            "count_mae": 0.0,
+            "count_accuracy": 0.0,
+            "parse_rate": 0.0,
+            "num_parsed": 0,
+        }
+    count_mae = sum(int(r.abs_error_lm_text or 0) for r in valid) / len(valid)
+    count_acc = sum(1.0 for r in valid if (r.abs_error_lm_text or -1) == 0) / len(valid)
+    return {
+        "count_mae": count_mae,
+        "count_accuracy": count_acc,
+        "parse_rate": len(valid) / total,
+        "num_parsed": len(valid),
+    }
+
+
+def aggregate_lm_box_metrics(rows: list[EvalRow]) -> dict[str, float]:
+    if not rows:
+        return {
+            "count_mae": 0.0,
+            "count_accuracy": 0.0,
+            "precision": 0.0,
+            "recall": 0.0,
+            "f1": 0.0,
+        }
+    count_mae = sum(r.abs_error_lm_boxes for r in rows) / len(rows)
+    count_acc = sum(1.0 for r in rows if r.abs_error_lm_boxes == 0) / len(rows)
+    precision = sum(r.precision_lm_boxes for r in rows) / len(rows)
+    recall = sum(r.recall_lm_boxes for r in rows) / len(rows)
+    f1 = sum(r.f1_lm_boxes for r in rows) / len(rows)
+    return {
+        "count_mae": count_mae,
+        "count_accuracy": count_acc,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+    }
+
+
+def extract_count_from_text(text: str) -> int | None:
+    patterns = [
+        r"total\s*count\s*[:=]\s*(-?\d+)",
+        r"count\s*[:=]\s*(-?\d+)",
+    ]
+    for pat in patterns:
+        m = re.search(pat, text, flags=re.IGNORECASE)
+        if m:
+            try:
+                return int(m.group(1))
+            except Exception:
+                pass
+    nums = re.findall(r"(?<![\d.])-?\d+(?![\d.])", text)
+    if len(nums) == 1:
+        try:
+            return int(nums[0])
+        except Exception:
+            return None
+    return None
 
 
 def cxcywh_to_xyxy_abs(boxes: torch.Tensor, width: int, height: int) -> torch.Tensor:
@@ -267,6 +351,7 @@ def main() -> None:
     )
 
     rows: list[EvalRow] = []
+    lm_text_preview: list[dict[str, Any]] = []
     for idx in range(start, end):
         ex = ds[idx]
         user_text, assistant_text = extract_user_assistant_from_example(ex)
@@ -333,17 +418,79 @@ def main() -> None:
         gt_xyxy = cxcywh_to_xyxy_abs(gt_boxes, width=w, height=h)
 
         precision, recall, f1 = detection_prf(pred_xyxy, gt_xyxy, iou_thr=args.iou_threshold)
+        lm_pred_count_text: int | None = None
+        lm_abs_error_text: int | None = None
+        lm_pred_count_boxes = 0
+        lm_abs_error_boxes = 0
+        lm_precision = 0.0
+        lm_recall = 0.0
+        lm_f1 = 0.0
+        lm_text = ""
+        lm_xyxy = torch.zeros((0, 4), dtype=torch.float32)
+        if args.eval_lm_generation:
+            gen_kwargs = {
+                "input_ids": inputs["input_ids"],
+                "attention_mask": inputs.get("attention_mask"),
+                "max_new_tokens": int(args.lm_max_new_tokens),
+                "do_sample": False,
+            }
+            if "pixel_values" in inputs:
+                gen_kwargs["pixel_values"] = inputs.get("pixel_values")
+            if "image_grid_thw" in inputs:
+                gen_kwargs["image_grid_thw"] = inputs.get("image_grid_thw")
+            with torch.no_grad():
+                gen_ids = model.base_model.generate(**gen_kwargs)
+            gen_trimmed = [
+                out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs["input_ids"], gen_ids)
+            ]
+            lm_text = processor.batch_decode(
+                gen_trimmed,
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=False,
+            )[0]
+            lm_pred_count_text = extract_count_from_text(lm_text)
+            lm_boxes = parse_boxes_from_text(
+                lm_text,
+                width=w,
+                height=h,
+                coord_mode="auto",
+                coord_order="auto",
+            )
+            lm_xyxy = cxcywh_to_xyxy_abs(lm_boxes, width=w, height=h)
+            lm_pred_count_boxes = int(lm_boxes.shape[0])
+            lm_abs_error_boxes = abs(lm_pred_count_boxes - int(gt_boxes.shape[0]))
+            lm_precision, lm_recall, lm_f1 = detection_prf(lm_xyxy, gt_xyxy, iou_thr=args.iou_threshold)
+            if lm_pred_count_text is not None:
+                lm_abs_error_text = abs(int(lm_pred_count_text) - int(gt_boxes.shape[0]))
+            if len(lm_text_preview) < 20:
+                lm_text_preview.append(
+                    {
+                        "index": idx,
+                        "gt_count": int(gt_boxes.shape[0]),
+                        "lm_count_text": lm_pred_count_text,
+                        "lm_count_boxes": lm_pred_count_boxes,
+                        "text": lm_text,
+                    }
+                )
+
         gt_count = int(gt_boxes.shape[0])
         pred_count = int(pred_boxes.shape[0])
         row = EvalRow(
             index=idx,
             gt_count=gt_count,
-            pred_count=pred_count,
-            pred_count_soft=pred_count_soft,
-            abs_error=abs(pred_count - gt_count),
-            precision=precision,
-            recall=recall,
-            f1=f1,
+            pred_count_detr=pred_count,
+            pred_count_soft_detr=pred_count_soft,
+            abs_error_detr=abs(pred_count - gt_count),
+            precision_detr=precision,
+            recall_detr=recall,
+            f1_detr=f1,
+            pred_count_lm_text=lm_pred_count_text,
+            abs_error_lm_text=lm_abs_error_text,
+            pred_count_lm_boxes=lm_pred_count_boxes,
+            abs_error_lm_boxes=lm_abs_error_boxes,
+            precision_lm_boxes=lm_precision,
+            recall_lm_boxes=lm_recall,
+            f1_lm_boxes=lm_f1,
             bucket=bucket_from_gt_count(
                 gt_count=gt_count,
                 easy_max=args.easy_max,
@@ -357,17 +504,25 @@ def main() -> None:
             vis = img.copy()
             draw_boxes(vis, gt_xyxy, color="lime", width=3)
             draw_boxes(vis, pred_xyxy, color="red", width=2)
+            if args.eval_lm_generation:
+                draw_boxes(vis, lm_xyxy, color="dodgerblue", width=2)
             vis.save(os.path.join(args.overlay_dir, f"sample_{idx}.png"))
 
         if (idx - start + 1) % 50 == 0:
             recent = rows[-50:]
-            mae = sum(r.abs_error for r in recent) / len(recent)
-            print(f"processed={idx-start+1}/{end-start}, recent_mae={mae:.3f}")
+            mae = sum(r.abs_error_detr for r in recent) / len(recent)
+            lm_mae = sum(r.abs_error_lm_boxes for r in recent) / len(recent)
+            print(
+                f"processed={idx-start+1}/{end-start}, recent_mae_detr={mae:.3f}, "
+                f"recent_mae_lm_boxes={lm_mae:.3f}"
+            )
 
     if not rows:
         raise RuntimeError("No samples evaluated.")
 
-    metrics = aggregate_metrics(rows)
+    metrics_det = aggregate_det_metrics(rows)
+    metrics_lm_text = aggregate_lm_text_metrics(rows)
+    metrics_lm_boxes = aggregate_lm_box_metrics(rows)
 
     bucket_ranges = {
         "easy": f"<= {args.easy_max}",
@@ -379,11 +534,15 @@ def main() -> None:
     bucket_metrics: dict[str, dict[str, float | int | str]] = {}
     for bucket in bucket_order:
         b_rows = [r for r in rows if r.bucket == bucket]
-        b_metrics = aggregate_metrics(b_rows)
+        b_metrics_det = aggregate_det_metrics(b_rows)
+        b_metrics_lm_text = aggregate_lm_text_metrics(b_rows)
+        b_metrics_lm_boxes = aggregate_lm_box_metrics(b_rows)
         bucket_metrics[bucket] = {
             "range": bucket_ranges[bucket],
             "num_samples": len(b_rows),
-            **b_metrics,
+            **b_metrics_det,
+            "lm_text": b_metrics_lm_text,
+            "lm_boxes": b_metrics_lm_boxes,
         }
 
     summary = {
@@ -405,14 +564,24 @@ def main() -> None:
             "hard_max": args.hard_max,
         },
         "vision_enabled": bool(use_vision),
-        "metrics": metrics,
+        "eval_lm_generation": bool(args.eval_lm_generation),
+        "metrics": metrics_det,
+        "metrics_detr": metrics_det,
+        "metrics_lm_text": metrics_lm_text,
+        "metrics_lm_boxes": metrics_lm_boxes,
         "bucket_metrics": bucket_metrics,
+        "lm_text_preview": lm_text_preview,
         "rows": [asdict(r) for r in rows],
     }
     with open(args.output_json, "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
 
-    print(json.dumps(summary["metrics"], indent=2))
+    print("DETR metrics:")
+    print(json.dumps(summary["metrics_detr"], indent=2))
+    print("LM text-count metrics:")
+    print(json.dumps(summary["metrics_lm_text"], indent=2))
+    print("LM generated-box metrics:")
+    print(json.dumps(summary["metrics_lm_boxes"], indent=2))
     print("Bucket metrics:")
     for bucket in bucket_order:
         bm = bucket_metrics[bucket]
@@ -420,6 +589,16 @@ def main() -> None:
             f"  {bucket:<7} range={bm['range']:<8} n={bm['num_samples']:<4} "
             f"mae={bm['count_mae']:.3f} soft_mae={bm['count_soft_mae']:.3f} acc={bm['count_accuracy']:.3f} "
             f"p={bm['precision']:.3f} r={bm['recall']:.3f} f1={bm['f1']:.3f}"
+        )
+        lm_t = bm["lm_text"]
+        lm_b = bm["lm_boxes"]
+        print(
+            f"           lm_text: mae={float(lm_t['count_mae']):.3f} acc={float(lm_t['count_accuracy']):.3f} "
+            f"parse_rate={float(lm_t['parse_rate']):.3f} parsed={int(lm_t['num_parsed'])}"
+        )
+        print(
+            f"           lm_boxes: mae={float(lm_b['count_mae']):.3f} acc={float(lm_b['count_accuracy']):.3f} "
+            f"p={float(lm_b['precision']):.3f} r={float(lm_b['recall']):.3f} f1={float(lm_b['f1']):.3f}"
         )
     print(f"Saved eval json: {args.output_json}")
 

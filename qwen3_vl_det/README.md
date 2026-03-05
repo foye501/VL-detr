@@ -125,6 +125,14 @@ python -m qwen3_vl_det.train_sharegpt_aux \
   --output-dir qwen3_vl_det/checkpoints_aux_synth_v2
 ```
 
+Or run train + split eval + one-sample overlay in one command:
+
+```bash
+DATASET_FROM_DISK=qwen3_vl_det/data_synth_v2/train \
+OUTPUT_DIR=qwen3_vl_det/checkpoints_aux_synth_v2 \
+bash qwen3_vl_det/run_experiment_aux.sh
+```
+
 ## What This Adds
 
 - `modeling.py`: wrapper that adds:

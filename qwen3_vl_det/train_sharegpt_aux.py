@@ -23,6 +23,7 @@ from qwen3_vl_det.modeling import (
     Qwen3VLAuxDetrAdapter,
 )
 from qwen3_vl_det.train_sharegpt import (
+    BOX_SUPERVISION_CHOICES,
     _extract_image,
     extract_gt_boxes_from_example,
     extract_user_assistant_from_example,
@@ -62,6 +63,7 @@ class TrainAuxArgs:
     require_vision: bool = False
     box_coord_mode: str = "auto"  # auto | absolute | norm1000 | norm01
     box_coord_order: str = "auto"  # auto | xyxy | yxyx
+    box_supervision_source: str = "all"  # target | all
     seed: int = 7
     hf_token: str = ""
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -105,6 +107,11 @@ def parse_args() -> TrainAuxArgs:
         choices=["auto", "xyxy", "yxyx"],
         default=TrainAuxArgs.box_coord_order,
     )
+    p.add_argument(
+        "--box-supervision-source",
+        choices=list(BOX_SUPERVISION_CHOICES),
+        default=TrainAuxArgs.box_supervision_source,
+    )
     p.add_argument("--seed", type=int, default=TrainAuxArgs.seed)
     p.add_argument("--hf-token", default=TrainAuxArgs.hf_token)
     p.add_argument("--device", default=TrainAuxArgs.device)
@@ -120,12 +127,14 @@ class ShareGptAuxCollator:
         use_vision: bool,
         box_coord_mode: str,
         box_coord_order: str,
+        box_supervision_source: str,
     ) -> None:
         self.processor = processor
         self.max_length = max_length
         self.use_vision = use_vision
         self.box_coord_mode = box_coord_mode
         self.box_coord_order = box_coord_order
+        self.box_supervision_source = box_supervision_source
 
     def __call__(self, batch: list[dict[str, Any]]) -> dict[str, Any]:
         texts = []
@@ -167,6 +176,7 @@ class ShareGptAuxCollator:
                     assistant_text=assistant_text,
                     coord_mode=self.box_coord_mode,
                     coord_order=self.box_coord_order,
+                    box_supervision_source=self.box_supervision_source,
                 )
             )
 
@@ -255,6 +265,7 @@ def main() -> None:
         use_vision=use_vision,
         box_coord_mode=args.box_coord_mode,
         box_coord_order=args.box_coord_order,
+        box_supervision_source=args.box_supervision_source,
     )
     loader = DataLoader(
         ds,

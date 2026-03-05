@@ -38,6 +38,7 @@ python -m qwen3_vl_det.train_sharegpt_aux \
   --det-weight 0.3 \
   --box-coord-mode norm1000 \
   --box-coord-order yxyx \
+  --box-supervision-source all \
   --output-dir qwen3_vl_det/checkpoints_aux_run1
 ```
 
@@ -80,7 +81,48 @@ python -m qwen3_vl_det.train_sharegpt_aux \
   --epochs 3 \
   --lr 2e-5 \
   --det-weight 0.3 \
+  --box-supervision-source all \
   --output-dir qwen3_vl_det/checkpoints_aux_run1
+```
+
+## Generate Synthetic Dataset (Target + Distractor Boxes)
+
+If you want to regenerate synthetic data from scratch with explicit annotations for
+both target objects and distractors:
+
+```bash
+python -m qwen3_vl_det.generate_synth_counting_dataset \
+  --output-dir qwen3_vl_det/data_synth_v2 \
+  --split-name train \
+  --samples-per-level 2500 \
+  --image-size 512 \
+  --seed 7
+```
+
+This writes a `save_to_disk` dataset at:
+- `qwen3_vl_det/data_synth_v2/train`
+
+with fields such as:
+- `target_boxes_*`
+- `distractor_boxes_*`
+- `all_boxes_*`
+- `gt_count` (target count) and `gt_count_all` (all objects)
+
+Train auxiliary DETR supervision on all objects:
+
+```bash
+python -m qwen3_vl_det.train_sharegpt_aux \
+  --dataset-from-disk qwen3_vl_det/data_synth_v2/train \
+  --model-name Qwen/Qwen3-VL-2B-Instruct \
+  --require-vision \
+  --box-supervision-source all \
+  --box-coord-mode norm1000 \
+  --box-coord-order yxyx \
+  --num-queries 100 \
+  --batch-size 4 \
+  --grad-accum-steps 2 \
+  --epochs 3 \
+  --output-dir qwen3_vl_det/checkpoints_aux_synth_v2
 ```
 
 ## What This Adds
@@ -117,6 +159,9 @@ python -m qwen3_vl_det.train_sharegpt_aux \
 
 - `query_positions` must be exact token positions for query markers in each sample.
 - `gt_boxes` must be normalized to `[0,1]` in `cx, cy, w, h`.
+- Supervision source can be selected with `--box-supervision-source`:
+  - `target`: only objects matching the question target
+  - `all`: target + distractors (recommended for auxiliary DETR branch)
 - If your Qwen3-VL checkpoint requires a model class different from `AutoModelForCausalLM`,
   keep your existing model loader and pass the already-loaded model to `Qwen3VLDetrAdapter(...)`.
 

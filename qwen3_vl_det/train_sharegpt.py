@@ -13,7 +13,7 @@ import os
 import re
 from dataclasses import asdict
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Optional
 
 import torch
 import transformers
@@ -44,6 +44,7 @@ BOX_PATTERN = re.compile(
     r"<box>\s*\[\s*([-+]?\d*\.?\d+)\s*,\s*([-+]?\d*\.?\d+)\s*,\s*([-+]?\d*\.?\d+)\s*,\s*([-+]?\d*\.?\d+)\s*\]\s*</box>",
     flags=re.IGNORECASE,
 )
+BOX_SUPERVISION_CHOICES = ("target", "all")
 
 
 @dataclass
@@ -75,6 +76,7 @@ class TrainArgs:
     require_vision: bool = False
     box_coord_mode: str = "auto"  # auto | absolute | norm1000 | norm01
     box_coord_order: str = "auto"  # auto | xyxy | yxyx
+    box_supervision_source: str = "target"  # target | all
     seed: int = 7
     hf_token: str = ""
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -116,6 +118,11 @@ def parse_args() -> TrainArgs:
         "--box-coord-order",
         choices=["auto", "xyxy", "yxyx"],
         default=TrainArgs.box_coord_order,
+    )
+    p.add_argument(
+        "--box-supervision-source",
+        choices=list(BOX_SUPERVISION_CHOICES),
+        default=TrainArgs.box_supervision_source,
     )
     p.add_argument("--seed", type=int, default=TrainArgs.seed)
     p.add_argument("--hf-token", default=TrainArgs.hf_token)
@@ -422,6 +429,105 @@ def _as_float_box_tensor(value: Any) -> torch.Tensor:
     return t
 
 
+def _sanitize_cxcywh_norm(boxes: torch.Tensor) -> torch.Tensor:
+    if boxes.numel() == 0:
+        return torch.zeros((0, 4), dtype=torch.float32)
+    boxes = boxes.clamp(0, 1)
+    valid = (boxes[:, 2] > 0) & (boxes[:, 3] > 0)
+    return boxes[valid]
+
+
+def _raw_boxes_to_cxcywh_norm(
+    raw_boxes: list[list[float]],
+    width: int,
+    height: int,
+    coord_mode: str = "auto",
+    coord_order: str = "auto",
+) -> torch.Tensor:
+    mode = _infer_box_coord_mode(raw_boxes, width=width, height=height) if coord_mode == "auto" else coord_mode
+    order = (
+        _infer_box_coord_order(raw_boxes, width=width, height=height, mode=mode)
+        if coord_order == "auto"
+        else coord_order
+    )
+    boxes = []
+    for raw in raw_boxes:
+        x1, y1, x2, y2 = _convert_raw_box_to_pixels(
+            raw,
+            width=width,
+            height=height,
+            mode=mode,
+            order=order,
+        )
+        x1 = max(0.0, min(x1, float(width)))
+        x2 = max(0.0, min(x2, float(width)))
+        y1 = max(0.0, min(y1, float(height)))
+        y2 = max(0.0, min(y2, float(height)))
+        if x2 <= x1 or y2 <= y1:
+            continue
+        cx = ((x1 + x2) / 2.0) / float(width)
+        cy = ((y1 + y2) / 2.0) / float(height)
+        w = (x2 - x1) / float(width)
+        h = (y2 - y1) / float(height)
+        boxes.append([cx, cy, w, h])
+    if not boxes:
+        return torch.zeros((0, 4), dtype=torch.float32)
+    return _sanitize_cxcywh_norm(torch.tensor(boxes, dtype=torch.float32))
+
+
+def _extract_boxes_by_field(
+    example: dict[str, Any],
+    field_name: str,
+    width: int,
+    height: int,
+) -> Optional[torch.Tensor]:
+    if field_name not in example or example[field_name] is None:
+        return None
+    try:
+        t = _as_float_box_tensor(example[field_name])
+    except Exception:
+        return None
+    if t.numel() == 0:
+        return torch.zeros((0, 4), dtype=torch.float32)
+    if field_name.endswith("_cxcywh_norm"):
+        return _sanitize_cxcywh_norm(t)
+    if field_name.endswith("_xyxy_abs"):
+        return _boxes_xyxy_abs_to_cxcywh_norm(t, width=width, height=height)
+    if field_name.endswith("_xyxy_1000"):
+        t = t.clone()
+        t[:, [0, 2]] = t[:, [0, 2]] / 1000.0 * float(width)
+        t[:, [1, 3]] = t[:, [1, 3]] / 1000.0 * float(height)
+        return _boxes_xyxy_abs_to_cxcywh_norm(t, width=width, height=height)
+    if field_name.endswith("_yxyx_1000"):
+        y1 = t[:, 0] / 1000.0 * float(height)
+        x1 = t[:, 1] / 1000.0 * float(width)
+        y2 = t[:, 2] / 1000.0 * float(height)
+        x2 = t[:, 3] / 1000.0 * float(width)
+        xyxy = torch.stack([x1, y1, x2, y2], dim=-1)
+        return _boxes_xyxy_abs_to_cxcywh_norm(xyxy, width=width, height=height)
+    # Generic raw format fallback (e.g., gt_boxes / all_boxes / target_boxes / distractor_boxes).
+    return _raw_boxes_to_cxcywh_norm(
+        t.tolist(),
+        width=width,
+        height=height,
+        coord_mode="auto",
+        coord_order="auto",
+    )
+
+
+def _extract_from_candidates(
+    example: dict[str, Any],
+    width: int,
+    height: int,
+    field_names: list[str],
+) -> Optional[torch.Tensor]:
+    for name in field_names:
+        boxes = _extract_boxes_by_field(example, name, width=width, height=height)
+        if boxes is not None:
+            return boxes
+    return None
+
+
 def extract_gt_boxes_from_example(
     example: dict[str, Any],
     width: int,
@@ -429,37 +535,93 @@ def extract_gt_boxes_from_example(
     assistant_text: str,
     coord_mode: str = "auto",
     coord_order: str = "auto",
+    box_supervision_source: str = "target",
 ) -> torch.Tensor:
     """Extract GT boxes with support for normalized dataset fields and ShareGPT text boxes."""
-    # Preferred normalized field.
-    if "boxes_cxcywh_norm" in example and example["boxes_cxcywh_norm"] is not None:
-        t = _as_float_box_tensor(example["boxes_cxcywh_norm"]).clamp(0, 1)
-        if t.numel() == 0:
-            return t
-        valid = (t[:, 2] > 0) & (t[:, 3] > 0)
-        return t[valid]
+    source = str(box_supervision_source).strip().lower()
+    if source not in BOX_SUPERVISION_CHOICES:
+        raise ValueError(
+            f"Unsupported box_supervision_source={box_supervision_source!r}. "
+            f"Choose one of: {BOX_SUPERVISION_CHOICES}"
+        )
 
-    # Absolute xyxy field.
-    if "boxes_xyxy_abs" in example and example["boxes_xyxy_abs"] is not None:
-        t = _as_float_box_tensor(example["boxes_xyxy_abs"])
-        return _boxes_xyxy_abs_to_cxcywh_norm(t, width=width, height=height)
+    target_fields = [
+        "target_boxes_cxcywh_norm",
+        "boxes_cxcywh_norm",
+        "target_boxes_xyxy_abs",
+        "boxes_xyxy_abs",
+        "target_boxes_xyxy_1000",
+        "boxes_xyxy_1000",
+        "target_boxes_yxyx_1000",
+        "boxes_yxyx_1000",
+        "target_boxes",
+        "gt_boxes",
+    ]
+    distractor_fields = [
+        "distractor_boxes_cxcywh_norm",
+        "distractor_boxes_xyxy_abs",
+        "distractor_boxes_xyxy_1000",
+        "distractor_boxes_yxyx_1000",
+        "distractor_boxes",
+    ]
+    all_fields = [
+        "all_boxes_cxcywh_norm",
+        "all_boxes_xyxy_abs",
+        "all_boxes_xyxy_1000",
+        "all_boxes_yxyx_1000",
+        "all_boxes",
+    ]
 
-    # 1000-scale xyxy field.
-    if "boxes_xyxy_1000" in example and example["boxes_xyxy_1000"] is not None:
-        t = _as_float_box_tensor(example["boxes_xyxy_1000"])
-        t[:, [0, 2]] = t[:, [0, 2]] / 1000.0 * float(width)
-        t[:, [1, 3]] = t[:, [1, 3]] / 1000.0 * float(height)
-        return _boxes_xyxy_abs_to_cxcywh_norm(t, width=width, height=height)
+    if source == "all":
+        all_boxes = _extract_from_candidates(
+            example,
+            width=width,
+            height=height,
+            field_names=all_fields,
+        )
+        if all_boxes is not None:
+            return all_boxes
 
-    # 1000-scale yxyx field.
-    if "boxes_yxyx_1000" in example and example["boxes_yxyx_1000"] is not None:
-        t = _as_float_box_tensor(example["boxes_yxyx_1000"])
-        y1 = t[:, 0] / 1000.0 * float(height)
-        x1 = t[:, 1] / 1000.0 * float(width)
-        y2 = t[:, 2] / 1000.0 * float(height)
-        x2 = t[:, 3] / 1000.0 * float(width)
-        xyxy = torch.stack([x1, y1, x2, y2], dim=-1)
-        return _boxes_xyxy_abs_to_cxcywh_norm(xyxy, width=width, height=height)
+        target_boxes = _extract_from_candidates(
+            example,
+            width=width,
+            height=height,
+            field_names=target_fields,
+        )
+        distractor_boxes = _extract_from_candidates(
+            example,
+            width=width,
+            height=height,
+            field_names=distractor_fields,
+        )
+        if target_boxes is not None and distractor_boxes is not None:
+            if target_boxes.numel() == 0:
+                return distractor_boxes
+            if distractor_boxes.numel() == 0:
+                return target_boxes
+            return torch.cat([target_boxes, distractor_boxes], dim=0)
+
+        if target_boxes is not None:
+            return target_boxes
+
+    target_boxes = _extract_from_candidates(
+        example,
+        width=width,
+        height=height,
+        field_names=target_fields,
+    )
+    if target_boxes is not None:
+        return target_boxes
+
+    if source == "target":
+        all_boxes = _extract_from_candidates(
+            example,
+            width=width,
+            height=height,
+            field_names=all_fields,
+        )
+        if all_boxes is not None:
+            return all_boxes
 
     # Fallback: parse from assistant text.
     return parse_boxes_from_text(
@@ -494,6 +656,7 @@ class ShareGptCollator:
         use_vision: bool,
         box_coord_mode: str,
         box_coord_order: str,
+        box_supervision_source: str,
     ) -> None:
         self.processor = processor
         self.num_queries = num_queries
@@ -501,6 +664,7 @@ class ShareGptCollator:
         self.use_vision = use_vision
         self.box_coord_mode = box_coord_mode
         self.box_coord_order = box_coord_order
+        self.box_supervision_source = box_supervision_source
         self.query_token_id = int(processor.tokenizer.convert_tokens_to_ids(DET_QUERY_TOKEN))
         if self.query_token_id < 0:
             raise ValueError(f"{DET_QUERY_TOKEN} token id not found in tokenizer.")
@@ -548,6 +712,7 @@ class ShareGptCollator:
                     assistant_text=assistant_text,
                     coord_mode=self.box_coord_mode,
                     coord_order=self.box_coord_order,
+                    box_supervision_source=self.box_supervision_source,
                 )
             )
 
@@ -709,6 +874,7 @@ def main() -> None:
         use_vision=use_vision,
         box_coord_mode=args.box_coord_mode,
         box_coord_order=args.box_coord_order,
+        box_supervision_source=args.box_supervision_source,
     )
     loader = DataLoader(
         ds,

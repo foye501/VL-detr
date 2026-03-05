@@ -4,11 +4,16 @@ Output sample fields:
 - image
 - user_text
 - assistant_text
-- boxes_cxcywh_norm
-- boxes_xyxy_abs
+- boxes_cxcywh_norm (legacy alias: target boxes)
+- boxes_xyxy_abs (legacy alias: target boxes)
+- target_boxes_cxcywh_norm
+- target_boxes_xyxy_abs
+- all_boxes_cxcywh_norm
+- all_boxes_xyxy_abs
 - image_width
 - image_height
 - gt_count
+- gt_count_all
 - difficulty_bucket
 - source_index
 
@@ -82,9 +87,23 @@ def main() -> None:
             assistant_text=assistant_text,
             coord_mode=args.box_coord_mode,
             coord_order=args.box_coord_order,
+            box_supervision_source="target",
         )
         boxes_xyxy = cxcywh_norm_to_xyxy_abs(boxes_cxcywh, width=w, height=h)
+
+        all_boxes_cxcywh = extract_gt_boxes_from_example(
+            ex,
+            width=w,
+            height=h,
+            assistant_text=assistant_text,
+            coord_mode=args.box_coord_mode,
+            coord_order=args.box_coord_order,
+            box_supervision_source="all",
+        )
+        all_boxes_xyxy = cxcywh_norm_to_xyxy_abs(all_boxes_cxcywh, width=w, height=h)
+
         gt_count = int(boxes_cxcywh.shape[0])
+        gt_count_all = int(all_boxes_cxcywh.shape[0])
         bucket = bucket_from_count(
             gt_count,
             easy_max=args.easy_max,
@@ -97,11 +116,19 @@ def main() -> None:
                 "image": img,
                 "user_text": user_text,
                 "assistant_text": assistant_text,
+                # Keep legacy names for backward compatibility.
                 "boxes_cxcywh_norm": boxes_cxcywh.tolist(),
                 "boxes_xyxy_abs": boxes_xyxy.tolist(),
+                # Explicit target/all names for supervision control.
+                "target_boxes_cxcywh_norm": boxes_cxcywh.tolist(),
+                "target_boxes_xyxy_abs": boxes_xyxy.tolist(),
+                "all_boxes_cxcywh_norm": all_boxes_cxcywh.tolist(),
+                "all_boxes_xyxy_abs": all_boxes_xyxy.tolist(),
                 "image_width": int(w),
                 "image_height": int(h),
                 "gt_count": gt_count,
+                "gt_count_all": gt_count_all,
+                "num_distractors": max(gt_count_all - gt_count, 0),
                 "difficulty_bucket": bucket,
                 "source_index": int(i),
             }

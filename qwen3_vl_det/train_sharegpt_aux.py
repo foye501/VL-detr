@@ -71,6 +71,7 @@ class TrainAuxArgs:
     train_heads_only: bool = False
     require_vision: bool = False
     use_lora: bool = False
+    enable_vision_lora: bool = False
     lora_r: int = 16
     lora_alpha: int = 32
     lora_dropout: float = 0.05
@@ -123,6 +124,7 @@ def parse_args() -> TrainAuxArgs:
     p.add_argument("--train-heads-only", action="store_true")
     p.add_argument("--require-vision", action="store_true")
     p.add_argument("--use-lora", action="store_true")
+    p.add_argument("--enable-vision-lora", action="store_true")
     p.add_argument("--lora-r", type=int, default=TrainAuxArgs.lora_r)
     p.add_argument("--lora-alpha", type=int, default=TrainAuxArgs.lora_alpha)
     p.add_argument("--lora-dropout", type=float, default=TrainAuxArgs.lora_dropout)
@@ -336,6 +338,24 @@ def main() -> None:
         if get_peft_model is None or LoraConfig is None or TaskType is None:
             raise RuntimeError("peft is not installed. Install `peft` to use --use-lora.")
         target_modules = [x.strip() for x in args.lora_target_modules.split(",") if x.strip()]
+        if args.enable_vision_lora:
+            vision_linear_targets: list[str] = []
+            for mod_name, mod in model.base_model.named_modules():
+                lname = mod_name.lower()
+                if (("visual" in lname) or ("vision" in lname)) and isinstance(mod, torch.nn.Linear):
+                    vision_linear_targets.append(mod_name)
+            vision_linear_targets = sorted(set(vision_linear_targets))
+            if vision_linear_targets:
+                target_modules = sorted(set(target_modules + vision_linear_targets))
+                print(
+                    f"Vision LoRA enabled: added {len(vision_linear_targets)} "
+                    "vision linear modules to LoRA targets."
+                )
+            else:
+                print(
+                    "WARNING: --enable-vision-lora set, but no vision linear modules were found. "
+                    "No extra vision LoRA targets added."
+                )
         modules_to_save = [x.strip() for x in args.lora_modules_to_save.split(",") if x.strip()]
         lora_cfg = LoraConfig(
             task_type=TaskType.CAUSAL_LM,
@@ -359,6 +379,8 @@ def main() -> None:
         for n, p in model.base_model.named_parameters():
             lname = n.lower()
             if ("visual" in lname) or ("vision" in lname):
+                if args.enable_vision_lora and ("lora_" in lname):
+                    continue
                 p.requires_grad = False
                 frozen += 1
         print(f"Froze vision/backbone params: {frozen}")

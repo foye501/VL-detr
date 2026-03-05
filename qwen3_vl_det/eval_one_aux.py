@@ -9,7 +9,7 @@ from dataclasses import asdict
 from typing import Any
 
 import torch
-from PIL import ImageDraw
+from PIL import Image, ImageDraw
 from transformers import AutoTokenizer
 
 from qwen3_vl_det.modeling import AuxDetrBranchConfig, Qwen3VLAuxDetrAdapter
@@ -47,6 +47,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--require-vision", action="store_true")
     p.add_argument("--output-image", default="qwen3_vl_det/eval_aux_overlay.png")
+    p.add_argument("--output-json", default="")
+    p.add_argument("--print-topk", type=int, default=20)
+    p.add_argument("--annotate-scores", action="store_true")
     return p.parse_args()
 
 
@@ -68,6 +71,50 @@ def draw_boxes(img, boxes_xyxy: torch.Tensor, color: str, width: int = 3) -> Non
     draw = ImageDraw.Draw(img)
     for b in boxes_xyxy.tolist():
         draw.rectangle(b, outline=color, width=width)
+
+
+def draw_labeled_boxes(
+    img,
+    boxes_xyxy: torch.Tensor,
+    labels: list[str],
+    color: str,
+    width: int = 2,
+) -> None:
+    draw = ImageDraw.Draw(img)
+    for b, lab in zip(boxes_xyxy.tolist(), labels):
+        draw.rectangle(b, outline=color, width=width)
+        x1, y1, _, _ = b
+        tx = max(0, int(x1))
+        ty = max(0, int(y1) - 10)
+        draw.text((tx, ty), lab, fill=color)
+
+
+def _round4(v: float) -> float:
+    return round(float(v), 4)
+
+
+def _derive_path(base_path: str, suffix: str) -> str:
+    root, ext = os.path.splitext(base_path)
+    if not ext:
+        ext = ".png"
+    return f"{root}.{suffix}{ext}"
+
+
+def build_comparison_strip(
+    gt_img: Image.Image,
+    pred_img: Image.Image,
+    overlay_img: Image.Image,
+) -> Image.Image:
+    w, h = gt_img.size
+    out = Image.new("RGB", (w * 3, h + 22), color=(255, 255, 255))
+    out.paste(gt_img, (0, 22))
+    out.paste(pred_img, (w, 22))
+    out.paste(overlay_img, (2 * w, 22))
+    draw = ImageDraw.Draw(out)
+    draw.text((8, 4), "GT", fill="black")
+    draw.text((w + 8, 4), "Pred", fill="black")
+    draw.text((2 * w + 8, 4), "Overlay", fill="black")
+    return out
 
 
 def main() -> None:
@@ -188,8 +235,15 @@ def main() -> None:
 
     keep = obj_prob >= args.obj_threshold
     pred_boxes = box_pred[keep].detach().cpu()
+    pred_scores = obj_prob[keep].detach().cpu()
     pred_xyxy = cxcywh_to_xyxy_abs(pred_boxes, width=w, height=h)
     soft_count = float(obj_prob.sum().detach().cpu().item())
+
+    k = max(1, int(args.print_topk))
+    topk = min(k, int(obj_prob.shape[0]))
+    top_scores, top_idx = torch.topk(obj_prob.detach().cpu(), k=topk, largest=True)
+    top_boxes = box_pred.detach().cpu()[top_idx]
+    top_xyxy = cxcywh_to_xyxy_abs(top_boxes, width=w, height=h)
 
     raw_boxes = extract_boxes_raw(assistant_text)
     inferred_mode = _infer_box_coord_mode(raw_boxes, width=w, height=h)
@@ -219,12 +273,97 @@ def main() -> None:
     )
     gt_xyxy = cxcywh_to_xyxy_abs(gt_boxes, width=w, height=h)
 
-    vis = img.copy()
-    draw_boxes(vis, gt_xyxy, color="lime", width=3)
-    draw_boxes(vis, pred_xyxy, color="red", width=2)
-    vis.save(args.output_image)
+    vis_gt = img.copy()
+    draw_boxes(vis_gt, gt_xyxy, color="lime", width=3)  # GT
+
+    vis_pred = img.copy()
+    if args.annotate_scores and pred_xyxy.numel() > 0:
+        labels = [f"{_round4(s)}" for s in pred_scores.tolist()]
+        draw_labeled_boxes(vis_pred, pred_xyxy, labels=labels, color="red", width=2)
+    else:
+        draw_boxes(vis_pred, pred_xyxy, color="red", width=2)  # Pred
+
+    vis_overlay = img.copy()
+    draw_boxes(vis_overlay, gt_xyxy, color="lime", width=3)  # GT
+    if args.annotate_scores and pred_xyxy.numel() > 0:
+        labels = [f"{_round4(s)}" for s in pred_scores.tolist()]
+        draw_labeled_boxes(vis_overlay, pred_xyxy, labels=labels, color="red", width=2)
+    else:
+        draw_boxes(vis_overlay, pred_xyxy, color="red", width=2)  # Pred
+
+    gt_image_path = _derive_path(args.output_image, "gt")
+    pred_image_path = _derive_path(args.output_image, "pred")
+    compare_image_path = _derive_path(args.output_image, "compare")
+    vis_gt.save(gt_image_path)
+    vis_pred.save(pred_image_path)
+    vis_overlay.save(args.output_image)
+    compare = build_comparison_strip(vis_gt, vis_pred, vis_overlay)
+    compare.save(compare_image_path)
+
+    pred_items = []
+    for i in range(int(pred_boxes.shape[0])):
+        pred_items.append(
+            {
+                "rank": i,
+                "score": _round4(pred_scores[i].item()),
+                "cxcywh_norm": [_round4(v) for v in pred_boxes[i].tolist()],
+                "xyxy_abs": [_round4(v) for v in pred_xyxy[i].tolist()],
+            }
+        )
+    top_items = []
+    for i in range(topk):
+        top_items.append(
+            {
+                "query_idx": int(top_idx[i].item()),
+                "score": _round4(top_scores[i].item()),
+                "cxcywh_norm": [_round4(v) for v in top_boxes[i].tolist()],
+                "xyxy_abs": [_round4(v) for v in top_xyxy[i].tolist()],
+            }
+        )
+    gt_items = []
+    for i in range(int(gt_boxes.shape[0])):
+        gt_items.append(
+            {
+                "rank": i,
+                "cxcywh_norm": [_round4(v) for v in gt_boxes[i].tolist()],
+                "xyxy_abs": [_round4(v) for v in gt_xyxy[i].tolist()],
+            }
+        )
+
+    out_json = args.output_json.strip()
+    if not out_json:
+        out_json = args.output_image + ".json"
+    os.makedirs(os.path.dirname(out_json) or ".", exist_ok=True)
+    sidecar = {
+        "sample_index": int(args.sample_index),
+        "split": args.split,
+        "checkpoint_dir": args.checkpoint_dir,
+        "image_size": {"width": int(w), "height": int(h)},
+        "prompt_user_text": user_text,
+        "assistant_text": assistant_text,
+        "threshold": float(args.obj_threshold),
+        "counts": {
+            "gt_count": int(gt_boxes.shape[0]),
+            "pred_count_thresholded": int(pred_boxes.shape[0]),
+            "pred_soft_count": _round4(soft_count),
+        },
+        "gt_boxes": gt_items,
+        "pred_boxes_thresholded": pred_items,
+        "pred_topk_queries": top_items,
+        "settings": {
+            "box_coord_mode_used": used_mode,
+            "box_coord_order_used": used_order,
+            "box_supervision_source_used": effective_source,
+        },
+    }
+    with open(out_json, "w", encoding="utf-8") as f:
+        json.dump(sidecar, f, indent=2)
 
     print(f"Saved overlay: {args.output_image}")
+    print(f"Saved GT-only: {gt_image_path}")
+    print(f"Saved Pred-only: {pred_image_path}")
+    print(f"Saved side-by-side compare: {compare_image_path}")
+    print(f"Saved prediction json: {out_json}")
     print(f"GT count: {gt_boxes.shape[0]}")
     print(f"Pred count (@{args.obj_threshold:.2f}): {pred_boxes.shape[0]}")
     print(f"Pred soft count (sum probs): {soft_count:.2f}")
@@ -262,6 +401,12 @@ def main() -> None:
             },
         )
     print("Pred objectness (first 10):", [round(float(x), 4) for x in obj_prob[:10].detach().cpu()])
+    print(f"Top-{topk} queries by objectness:")
+    for item in top_items:
+        print(
+            f"  q={item['query_idx']:>3} score={item['score']:.4f} "
+            f"cxcywh={item['cxcywh_norm']} xyxy={item['xyxy_abs']}"
+        )
     if "det_stats" in out:
         print("Det stats:", json.dumps(out["det_stats"], indent=2))
     if "lm_loss" in out:

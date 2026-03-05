@@ -591,7 +591,13 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
                 image_grid_thw=base_inputs.get("image_grid_thw"),
             )
             if grid_coords is not None:
-                memory = memory + self.grid_pos_mlp(grid_coords.to(memory.dtype))
+                # Keep grid-pos MLP math in module dtype (often fp32), then cast
+                # back to memory dtype (often bf16) before residual add.
+                mlp_dtype = next(self.grid_pos_mlp.parameters()).dtype
+                pos = self.grid_pos_mlp(grid_coords.to(dtype=mlp_dtype))
+                if pos.dtype != memory.dtype:
+                    pos = pos.to(memory.dtype)
+                memory = memory + pos
             query_states = self._decode_queries(memory=memory, memory_mask=memory_mask)
             obj_logits = self.obj_head(query_states).squeeze(-1)  # [B, Q]
             box_pred = torch.sigmoid(self.box_head(query_states))  # [B, Q, 4]

@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 from dataclasses import asdict, dataclass
 from typing import Any
 
@@ -25,6 +26,7 @@ from qwen3_vl_det.modeling import (
 from qwen3_vl_det.train_sharegpt import (
     BOX_SUPERVISION_CHOICES,
     _extract_image,
+    cxcywh_norm_to_xyxy_abs,
     extract_gt_boxes_from_example,
     extract_user_assistant_from_example,
     load_split_dataset,
@@ -83,6 +85,11 @@ class TrainAuxArgs:
     box_coord_mode: str = "auto"  # auto | absolute | norm1000 | norm01
     box_coord_order: str = "auto"  # auto | xyxy | yxyx
     box_supervision_source: str = "all"  # target | all
+    lm_target_mode: str = "dataset"  # dataset | count_only | box_count | mixed
+    lm_box_source: str = "target"  # target | all
+    lm_box_ratio: float = 0.5  # used only for mixed
+    lm_box_output_mode: str = "norm1000"  # absolute | norm1000 | norm01
+    lm_box_output_order: str = "yxyx"  # xyxy | yxyx
     seed: int = 7
     hf_token: str = ""
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -150,6 +157,27 @@ def parse_args() -> TrainAuxArgs:
         choices=list(BOX_SUPERVISION_CHOICES),
         default=TrainAuxArgs.box_supervision_source,
     )
+    p.add_argument(
+        "--lm-target-mode",
+        choices=["dataset", "count_only", "box_count", "mixed"],
+        default=TrainAuxArgs.lm_target_mode,
+    )
+    p.add_argument(
+        "--lm-box-source",
+        choices=list(BOX_SUPERVISION_CHOICES),
+        default=TrainAuxArgs.lm_box_source,
+    )
+    p.add_argument("--lm-box-ratio", type=float, default=TrainAuxArgs.lm_box_ratio)
+    p.add_argument(
+        "--lm-box-output-mode",
+        choices=["absolute", "norm1000", "norm01"],
+        default=TrainAuxArgs.lm_box_output_mode,
+    )
+    p.add_argument(
+        "--lm-box-output-order",
+        choices=["xyxy", "yxyx"],
+        default=TrainAuxArgs.lm_box_output_order,
+    )
     p.add_argument("--seed", type=int, default=TrainAuxArgs.seed)
     p.add_argument("--hf-token", default=TrainAuxArgs.hf_token)
     p.add_argument("--device", default=TrainAuxArgs.device)
@@ -171,6 +199,11 @@ class ShareGptAuxCollator:
         box_coord_mode: str,
         box_coord_order: str,
         box_supervision_source: str,
+        lm_target_mode: str,
+        lm_box_source: str,
+        lm_box_ratio: float,
+        lm_box_output_mode: str,
+        lm_box_output_order: str,
         assistant_only_loss: bool,
     ) -> None:
         self.processor = processor
@@ -179,7 +212,65 @@ class ShareGptAuxCollator:
         self.box_coord_mode = box_coord_mode
         self.box_coord_order = box_coord_order
         self.box_supervision_source = box_supervision_source
+        self.lm_target_mode = lm_target_mode
+        self.lm_box_source = lm_box_source
+        self.lm_box_ratio = max(0.0, min(1.0, float(lm_box_ratio)))
+        self.lm_box_output_mode = lm_box_output_mode
+        self.lm_box_output_order = lm_box_output_order
         self.assistant_only_loss = assistant_only_loss
+
+    def _format_box_for_lm(self, xyxy_abs: list[float], width: int, height: int) -> list[float | int]:
+        x1, y1, x2, y2 = [float(v) for v in xyxy_abs]
+        if self.lm_box_output_mode == "absolute":
+            vals_xyxy = [x1, y1, x2, y2]
+            vals_xyxy = [int(round(v)) for v in vals_xyxy]
+        elif self.lm_box_output_mode == "norm01":
+            vals_xyxy = [
+                x1 / max(float(width), 1.0),
+                y1 / max(float(height), 1.0),
+                x2 / max(float(width), 1.0),
+                y2 / max(float(height), 1.0),
+            ]
+            vals_xyxy = [round(v, 4) for v in vals_xyxy]
+        else:  # norm1000
+            vals_xyxy = [
+                x1 / max(float(width), 1.0) * 1000.0,
+                y1 / max(float(height), 1.0) * 1000.0,
+                x2 / max(float(width), 1.0) * 1000.0,
+                y2 / max(float(height), 1.0) * 1000.0,
+            ]
+            vals_xyxy = [int(round(v)) for v in vals_xyxy]
+        if self.lm_box_output_order == "yxyx":
+            return [vals_xyxy[1], vals_xyxy[0], vals_xyxy[3], vals_xyxy[2]]
+        return vals_xyxy
+
+    def _assistant_text_from_mode(
+        self,
+        dataset_assistant_text: str,
+        lm_target_boxes: torch.Tensor,
+        width: int,
+        height: int,
+    ) -> str:
+        mode = self.lm_target_mode
+        if mode == "mixed":
+            mode = "box_count" if random.random() < self.lm_box_ratio else "count_only"
+        if mode == "dataset":
+            return dataset_assistant_text
+
+        count = int(lm_target_boxes.shape[0])
+        if mode == "count_only":
+            return f"Total count: {count}"
+
+        # box_count
+        if count <= 0:
+            return "Total count: 0"
+        xyxy = cxcywh_norm_to_xyxy_abs(lm_target_boxes, width=width, height=height)
+        lines: list[str] = []
+        for b in xyxy.tolist():
+            vals = self._format_box_for_lm(b, width=width, height=height)
+            lines.append(f"<box> [{vals[0]}, {vals[1]}, {vals[2]}, {vals[3]}] </box>")
+        lines.append(f"Total count: {count}")
+        return "\n".join(lines)
 
     def __call__(self, batch: list[dict[str, Any]]) -> dict[str, Any]:
         texts = []
@@ -188,9 +279,25 @@ class ShareGptAuxCollator:
         gt_boxes: list[torch.Tensor] = []
 
         for ex in batch:
-            user_text, assistant_text = extract_user_assistant_from_example(ex)
+            user_text, assistant_text_dataset = extract_user_assistant_from_example(ex)
             img = _extract_image(ex)
             width, height = img.size
+
+            lm_target_boxes = extract_gt_boxes_from_example(
+                ex,
+                width=width,
+                height=height,
+                assistant_text=assistant_text_dataset,
+                coord_mode=self.box_coord_mode,
+                coord_order=self.box_coord_order,
+                box_supervision_source=self.lm_box_source,
+            )
+            assistant_text = self._assistant_text_from_mode(
+                dataset_assistant_text=assistant_text_dataset,
+                lm_target_boxes=lm_target_boxes,
+                width=width,
+                height=height,
+            )
 
             user_text = user_text.replace("<image>", "").strip()
             user_msg = {
@@ -226,7 +333,7 @@ class ShareGptAuxCollator:
                     ex,
                     width=width,
                     height=height,
-                    assistant_text=assistant_text,
+                    assistant_text=assistant_text_dataset,
                     coord_mode=self.box_coord_mode,
                     coord_order=self.box_coord_order,
                     box_supervision_source=self.box_supervision_source,
@@ -291,6 +398,7 @@ def main() -> None:
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
     torch.manual_seed(args.seed)
+    random.seed(args.seed)
 
     token = args.hf_token if args.hf_token else True
     ds = load_split_dataset(
@@ -423,6 +531,11 @@ def main() -> None:
         box_coord_mode=args.box_coord_mode,
         box_coord_order=args.box_coord_order,
         box_supervision_source=args.box_supervision_source,
+        lm_target_mode=args.lm_target_mode,
+        lm_box_source=args.lm_box_source,
+        lm_box_ratio=args.lm_box_ratio,
+        lm_box_output_mode=args.lm_box_output_mode,
+        lm_box_output_order=args.lm_box_output_order,
         assistant_only_loss=args.assistant_only_loss,
     )
     loader = DataLoader(

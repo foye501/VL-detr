@@ -78,6 +78,7 @@ class TrainAuxArgs:
     lora_modules_to_save: str = ""
     merge_lora_on_save: bool = True
     freeze_vision_backbone: bool = False
+    strict_vision_memory: bool = True
     box_coord_mode: str = "auto"  # auto | absolute | norm1000 | norm01
     box_coord_order: str = "auto"  # auto | xyxy | yxyx
     box_supervision_source: str = "all"  # target | all
@@ -130,6 +131,8 @@ def parse_args() -> TrainAuxArgs:
     p.add_argument("--merge-lora-on-save", dest="merge_lora_on_save", action="store_true")
     p.add_argument("--no-merge-lora-on-save", dest="merge_lora_on_save", action="store_false")
     p.add_argument("--freeze-vision-backbone", action="store_true")
+    p.add_argument("--strict-vision-memory", dest="strict_vision_memory", action="store_true")
+    p.add_argument("--allow-token-fallback-memory", dest="strict_vision_memory", action="store_false")
     p.add_argument(
         "--box-coord-mode",
         choices=["auto", "absolute", "norm1000", "norm01"],
@@ -151,6 +154,7 @@ def parse_args() -> TrainAuxArgs:
     p.set_defaults(
         assistant_only_loss=TrainAuxArgs.assistant_only_loss,
         merge_lora_on_save=TrainAuxArgs.merge_lora_on_save,
+        strict_vision_memory=TrainAuxArgs.strict_vision_memory,
     )
     ns = p.parse_args()
     return TrainAuxArgs(**vars(ns))
@@ -306,7 +310,10 @@ def main() -> None:
         )
 
     image_token_id = args.image_token_id if args.image_token_id >= 0 else None
-    branch_cfg = AuxDetrBranchConfig(image_token_id=image_token_id)
+    branch_cfg = AuxDetrBranchConfig(
+        image_token_id=image_token_id,
+        strict_vision_memory=bool(args.strict_vision_memory),
+    )
     model = Qwen3VLAuxDetrAdapter.from_pretrained(
         args.model_name,
         num_queries=args.num_queries,
@@ -355,6 +362,29 @@ def main() -> None:
                 p.requires_grad = False
                 frozen += 1
         print(f"Froze vision/backbone params: {frozen}")
+
+    base_total = 0
+    base_trainable = 0
+    vision_total = 0
+    vision_trainable = 0
+    for n, p in model.base_model.named_parameters():
+        n_params = int(p.numel())
+        base_total += n_params
+        if p.requires_grad:
+            base_trainable += n_params
+        lname = n.lower()
+        if ("visual" in lname) or ("vision" in lname):
+            vision_total += n_params
+            if p.requires_grad:
+                vision_trainable += n_params
+    print(
+        "Base model trainability: "
+        f"trainable={base_trainable}/{base_total} "
+        f"({(100.0 * base_trainable / max(base_total, 1)):.4f}%) "
+        f"vision_trainable={vision_trainable}/{vision_total} "
+        f"({(100.0 * vision_trainable / max(vision_total, 1)):.4f}%) "
+        f"strict_vision_memory={bool(args.strict_vision_memory)}"
+    )
 
     model.to(args.device)
     model.train()

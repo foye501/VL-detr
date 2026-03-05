@@ -56,6 +56,7 @@ class AuxDetrBranchConfig:
     image_token_id: Optional[int] = None
     use_grid_pos: bool = True
     prefer_output_vision_states: bool = True
+    strict_vision_memory: bool = False
 
 
 class Qwen3VLDetrAdapter(nn.Module):
@@ -410,6 +411,9 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
             if torch.is_tensor(v):
                 states = v
                 break
+            if isinstance(v, (list, tuple)) and len(v) > 0 and torch.is_tensor(v[-1]):
+                states = v[-1]
+                break
         if states is None:
             return None
 
@@ -443,7 +447,12 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
         image_grid_thw: Optional[torch.Tensor] = None,
         outputs: Optional[Any] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Extract per-sample visual token states using the image token id mask."""
+        """Extract visual memory for DETR.
+
+        Preferred path is model-provided vision states. Fallback path (image-token
+        masking over language hidden states) is disabled when strict_vision_memory is
+        enabled.
+        """
         bsz, _, hidden = hidden_states.shape
         counts_from_thw = self._grid_counts_from_thw(image_grid_thw=image_grid_thw, bsz=bsz)
 
@@ -456,6 +465,13 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
         )
         if from_outputs is not None:
             return from_outputs
+
+        if self.branch_cfg.strict_vision_memory:
+            raise RuntimeError(
+                "strict_vision_memory=True but no model-provided vision states were found "
+                "(expected one of: image_hidden_states / vision_hidden_states / "
+                "visual_hidden_states). DETR memory fallback to language hidden states is disabled."
+            )
 
         image_token_id = self._infer_image_token_id(input_ids)
 

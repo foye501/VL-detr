@@ -385,6 +385,11 @@ def main() -> None:
         f"({(100.0 * vision_trainable / max(vision_total, 1)):.4f}%) "
         f"strict_vision_memory={bool(args.strict_vision_memory)}"
     )
+    if bool(args.strict_vision_memory) and vision_trainable == 0:
+        print(
+            "WARNING: strict_vision_memory is enabled, but no vision parameters are trainable. "
+            "DETR loss cannot improve the vision encoder in this configuration."
+        )
 
     model.to(args.device)
     model.train()

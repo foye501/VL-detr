@@ -440,10 +440,96 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
 
         return None
 
+    def _extract_visual_memory_from_image_features(
+        self,
+        pixel_values: Optional[torch.Tensor],
+        image_grid_thw: Optional[torch.Tensor],
+        input_ids: torch.Tensor,
+        hidden: int,
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+        """Extract visual memory via model.get_image_features() if available.
+
+        This keeps DETR supervision on vision-side outputs even when the model's
+        forward output does not expose `image_hidden_states`.
+        """
+        if pixel_values is None or not torch.is_tensor(pixel_values):
+            return None
+        if not hasattr(self.base_model, "get_image_features"):
+            return None
+        try:
+            image_outputs = self.base_model.get_image_features(
+                pixel_values=pixel_values,
+                image_grid_thw=image_grid_thw,
+                return_dict=True,
+            )
+        except Exception:
+            return None
+
+        pooler = getattr(image_outputs, "pooler_output", None)
+        if pooler is None:
+            return None
+
+        # Common case for Qwen3-VL: list[Tensor[Li, H]] per sample.
+        if isinstance(pooler, (list, tuple)) and len(pooler) > 0:
+            feats_list = []
+            for t in pooler:
+                if not torch.is_tensor(t):
+                    return None
+                if t.dim() == 1:
+                    if int(t.shape[0]) != hidden:
+                        return None
+                    t = t.unsqueeze(0)
+                if t.dim() != 2 or int(t.shape[-1]) != hidden:
+                    return None
+                feats_list.append(t)
+            if not feats_list:
+                return None
+            bsz = len(feats_list)
+            max_len = max(int(x.shape[0]) for x in feats_list)
+            device = feats_list[0].device
+            dtype = feats_list[0].dtype
+            memory = torch.zeros((bsz, max_len, hidden), device=device, dtype=dtype)
+            mask = torch.zeros((bsz, max_len), device=device, dtype=torch.bool)
+            for b, x in enumerate(feats_list):
+                n = int(x.shape[0])
+                if n > 0:
+                    memory[b, :n] = x
+                    mask[b, :n] = True
+            return memory, mask
+
+        # If already batched [B, L, H], use directly.
+        if torch.is_tensor(pooler) and pooler.dim() == 3 and int(pooler.shape[-1]) == hidden:
+            memory = pooler
+            mask = torch.ones(memory.shape[:2], device=memory.device, dtype=torch.bool)
+            return memory, mask
+
+        # If flattened [sumL, H], split by image placeholder counts.
+        if torch.is_tensor(pooler) and pooler.dim() == 2 and int(pooler.shape[-1]) == hidden:
+            image_token_id = self._infer_image_token_id(input_ids)
+            counts = []
+            for b in range(int(input_ids.shape[0])):
+                counts.append(int((input_ids[b] == image_token_id).sum().item()))
+            total = sum(counts)
+            if total <= 0 or int(pooler.shape[0]) < total:
+                return None
+            max_len = max(counts) if counts else 0
+            memory = pooler.new_zeros((int(input_ids.shape[0]), max_len, hidden))
+            mask = torch.zeros((int(input_ids.shape[0]), max_len), device=pooler.device, dtype=torch.bool)
+            offset = 0
+            for b, n in enumerate(counts):
+                if n > 0:
+                    memory[b, :n] = pooler[offset : offset + n]
+                    mask[b, :n] = True
+                    offset += n
+            return memory, mask
+
+        return None
+
     def _extract_visual_memory(
         self,
         hidden_states: torch.Tensor,
         input_ids: torch.Tensor,
+        pixel_values: Optional[torch.Tensor] = None,
         image_grid_thw: Optional[torch.Tensor] = None,
         outputs: Optional[Any] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -466,11 +552,22 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
         if from_outputs is not None:
             return from_outputs
 
+        # For Qwen3-VL, explicit image hidden states may not be exposed in outputs;
+        # query vision-side features directly from get_image_features().
+        from_image_features = self._extract_visual_memory_from_image_features(
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+            input_ids=input_ids,
+            hidden=hidden,
+        )
+        if from_image_features is not None:
+            return from_image_features
+
         if self.branch_cfg.strict_vision_memory:
             raise RuntimeError(
                 "strict_vision_memory=True but no model-provided vision states were found "
-                "(expected one of: image_hidden_states / vision_hidden_states / "
-                "visual_hidden_states). DETR memory fallback to language hidden states is disabled."
+                "(expected one of: image_hidden_states / vision_hidden_states / visual_hidden_states "
+                "or get_image_features pooler_output). DETR memory fallback to language hidden states is disabled."
             )
 
         image_token_id = self._infer_image_token_id(input_ids)
@@ -598,6 +695,7 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
             memory, memory_mask = self._extract_visual_memory(
                 hidden_states=hidden,
                 input_ids=input_ids,
+                pixel_values=base_inputs.get("pixel_values"),
                 image_grid_thw=base_inputs.get("image_grid_thw"),
                 outputs=outputs,
             )

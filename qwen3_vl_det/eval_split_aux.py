@@ -143,8 +143,8 @@ def aggregate_lm_text_metrics(rows: list[EvalRow]) -> dict[str, float | int]:
             "parse_rate": 0.0,
             "num_parsed": 0,
         }
-    count_mae = sum(int(r.abs_error_lm_text or 0) for r in valid) / len(valid)
-    count_acc = sum(1.0 for r in valid if (r.abs_error_lm_text or -1) == 0) / len(valid)
+    count_mae = sum(int(r.abs_error_lm_text) for r in valid if r.abs_error_lm_text is not None) / len(valid)
+    count_acc = sum(1.0 for r in valid if r.abs_error_lm_text == 0) / len(valid)
     return {
         "count_mae": count_mae,
         "count_accuracy": count_acc,

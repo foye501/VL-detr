@@ -25,6 +25,7 @@ from transformers import AutoTokenizer
 from qwen3_vl_det.modeling import AuxDetrBranchConfig, Qwen3VLAuxDetrAdapter
 from qwen3_vl_det.train_sharegpt import (
     BOX_SUPERVISION_CHOICES,
+    DET_QUERY_TOKEN,
     _extract_image,
     extract_gt_boxes_from_example,
     extract_user_assistant_from_example,
@@ -307,6 +308,11 @@ def build_model_and_processor(args: argparse.Namespace):
         model.load_state_dict(adapter_state["adapter_state_dict"], strict=False)
     model.to(args.device)
     model.eval()
+    if bool(getattr(branch_cfg, "inject_det_queries_to_lm", False)):
+        print(
+            "LM fusion mode: enabled "
+            f"(det_query_token_id={getattr(branch_cfg, 'det_query_token_id', None)})"
+        )
     return model, tokenizer, processor, use_vision, train_args
 
 
@@ -374,6 +380,11 @@ def main() -> None:
         w, h = img.size
 
         user_text = user_text.replace("<image>", "").strip()
+        if bool(getattr(model.branch_cfg, "inject_det_queries_to_lm", False)) and (
+            getattr(model.branch_cfg, "det_query_token_id", None) is not None
+        ):
+            query_text = " ".join([DET_QUERY_TOKEN] * max(int(args.num_queries), 1))
+            user_text = f"{user_text}\n{query_text}"
         chat_messages = [
             {
                 "role": "user",
@@ -454,9 +465,10 @@ def main() -> None:
             if "image_grid_thw" in inputs:
                 gen_kwargs["image_grid_thw"] = inputs.get("image_grid_thw")
             with torch.no_grad():
-                gen_ids = model.base_model.generate(**gen_kwargs)
+                gen_ids = model.generate_with_det_injection(**gen_kwargs)
             gen_trimmed = [
-                out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs["input_ids"], gen_ids)
+                (out_ids[len(in_ids) :] if out_ids.shape[0] > in_ids.shape[0] else out_ids)
+                for in_ids, out_ids in zip(inputs["input_ids"], gen_ids)
             ]
             lm_text = processor.batch_decode(
                 gen_trimmed,

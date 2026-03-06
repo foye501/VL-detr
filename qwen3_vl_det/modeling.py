@@ -57,6 +57,9 @@ class AuxDetrBranchConfig:
     use_grid_pos: bool = True
     prefer_output_vision_states: bool = True
     strict_vision_memory: bool = False
+    inject_det_queries_to_lm: bool = False
+    det_query_token_id: Optional[int] = None
+    detach_det_queries_for_lm: bool = False
 
 
 class Qwen3VLDetrAdapter(nn.Module):
@@ -290,6 +293,7 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
         self.hungarian_cfg = hungarian_cfg or HungarianLossConfig()
         self.loss_cfg = loss_cfg or AdapterLossConfig()
         self._warned_visual_fallback = False
+        self._warned_lm_fusion_fail = False
 
     @classmethod
     def from_pretrained(
@@ -656,6 +660,41 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
         )
         return self.det_norm(query_states)
 
+    def _inject_det_queries_into_inputs_embeds(
+        self,
+        input_ids: Optional[torch.Tensor],
+        query_states: torch.Tensor,
+    ) -> tuple[Optional[torch.Tensor], int]:
+        """Replace DET query-token embeddings with visual query states."""
+        if input_ids is None or not torch.is_tensor(input_ids):
+            return None, 0
+        token_id = self.branch_cfg.det_query_token_id
+        if token_id is None:
+            return None, 0
+        embed_layer = self.base_model.get_input_embeddings()
+        if embed_layer is None:
+            return None, 0
+
+        inputs_embeds = embed_layer(input_ids)
+        injected = 0
+        for b in range(int(input_ids.shape[0])):
+            pos = torch.where(input_ids[b] == int(token_id))[0]
+            if pos.numel() == 0:
+                continue
+            n = min(int(pos.numel()), int(query_states.shape[1]))
+            if n <= 0:
+                continue
+            q = query_states[b, :n]
+            if self.branch_cfg.detach_det_queries_for_lm:
+                q = q.detach()
+            if q.dtype != inputs_embeds.dtype:
+                q = q.to(inputs_embeds.dtype)
+            inputs_embeds[b, pos[:n]] = q
+            injected += n
+        if injected <= 0:
+            return None, 0
+        return inputs_embeds, injected
+
     def forward(
         self,
         gt_boxes: Optional[list[torch.Tensor]] = None,
@@ -671,10 +710,15 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
           return_det: if False and gt_boxes is None, DETR outputs are omitted.
           **base_inputs: input_ids, labels, pixel_values, image_grid_thw, ...
         """
+        first_inputs = dict(base_inputs)
+        if self.branch_cfg.inject_det_queries_to_lm:
+            # LM loss will be computed from a fused second pass after DET query injection.
+            first_inputs.pop("labels", None)
+
         outputs = self.base_model(
             output_hidden_states=True,
             return_dict=True,
-            **base_inputs,
+            **first_inputs,
         )
 
         result: dict[str, Any] = {"base_outputs": outputs}
@@ -686,6 +730,7 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
 
         det_loss = None
         need_det = det_enabled and (gt_boxes is not None or return_det)
+        query_states = None
         if need_det:
             input_ids = base_inputs.get("input_ids")
             if input_ids is None:
@@ -729,6 +774,47 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
                 result["det_loss"] = det_loss
                 result["det_stats"] = det_stats
 
+        if (
+            self.branch_cfg.inject_det_queries_to_lm
+            and query_states is not None
+            and ("labels" in base_inputs)
+            and (base_inputs.get("labels") is not None)
+        ):
+            input_ids = base_inputs.get("input_ids")
+            inputs_embeds, injected = self._inject_det_queries_into_inputs_embeds(
+                input_ids=input_ids,
+                query_states=query_states,
+            )
+            result["lm_det_query_injected"] = bool(injected > 0)
+            result["lm_det_query_injected_count"] = int(injected)
+            if inputs_embeds is not None:
+                second_inputs = dict(base_inputs)
+                # Use injected embeddings as LM input. We avoid passing pixel tensors in
+                # this second pass to keep input path unambiguous.
+                second_inputs.pop("input_ids", None)
+                second_inputs.pop("pixel_values", None)
+                second_inputs.pop("image_grid_thw", None)
+                second_inputs["inputs_embeds"] = inputs_embeds
+                try:
+                    fused_outputs = self.base_model(
+                        output_hidden_states=False,
+                        return_dict=True,
+                        **second_inputs,
+                    )
+                    result["lm_fused_outputs"] = fused_outputs
+                    if hasattr(fused_outputs, "logits"):
+                        result["logits"] = fused_outputs.logits
+                    lm_loss = getattr(fused_outputs, "loss", lm_loss)
+                    if lm_loss is not None:
+                        result["lm_loss"] = lm_loss
+                except Exception as exc:
+                    if not self._warned_lm_fusion_fail:
+                        print(
+                            "WARNING: DETR-to-LM fusion second pass failed; "
+                            f"falling back to base LM path. error={type(exc).__name__}: {exc}"
+                        )
+                        self._warned_lm_fusion_fail = True
+
         total_loss = None
         if lm_loss is not None and det_loss is not None:
             total_loss = self.loss_cfg.lm_weight * lm_loss + self.loss_cfg.det_weight * det_loss
@@ -740,3 +826,70 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
         if total_loss is not None:
             result["loss"] = total_loss
         return result
+
+    @torch.no_grad()
+    def generate_with_det_injection(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        pixel_values: Optional[torch.Tensor] = None,
+        image_grid_thw: Optional[torch.Tensor] = None,
+        **generate_kwargs: Any,
+    ) -> torch.Tensor:
+        """Generate text using DETR query-state injection into LM prompt embeddings."""
+        if not self.branch_cfg.inject_det_queries_to_lm:
+            gen_inputs: dict[str, Any] = {"input_ids": input_ids}
+            if attention_mask is not None:
+                gen_inputs["attention_mask"] = attention_mask
+            if pixel_values is not None:
+                gen_inputs["pixel_values"] = pixel_values
+            if image_grid_thw is not None:
+                gen_inputs["image_grid_thw"] = image_grid_thw
+            return self.base_model.generate(**gen_inputs, **generate_kwargs)
+
+        outputs = self.base_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+        hidden = outputs.hidden_states[-1]
+        memory, memory_mask = self._extract_visual_memory(
+            hidden_states=hidden,
+            input_ids=input_ids,
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+            outputs=outputs,
+        )
+        grid_coords = self._build_grid_coord_tensor(
+            memory=memory,
+            memory_mask=memory_mask,
+            image_grid_thw=image_grid_thw,
+        )
+        if grid_coords is not None:
+            mlp_dtype = next(self.grid_pos_mlp.parameters()).dtype
+            pos = self.grid_pos_mlp(grid_coords.to(dtype=mlp_dtype))
+            if pos.dtype != memory.dtype:
+                pos = pos.to(memory.dtype)
+            memory = memory + pos
+        query_states = self._decode_queries(memory=memory, memory_mask=memory_mask)
+        inputs_embeds, injected = self._inject_det_queries_into_inputs_embeds(
+            input_ids=input_ids,
+            query_states=query_states,
+        )
+        if inputs_embeds is None or injected <= 0:
+            gen_inputs = {"input_ids": input_ids}
+            if attention_mask is not None:
+                gen_inputs["attention_mask"] = attention_mask
+            if pixel_values is not None:
+                gen_inputs["pixel_values"] = pixel_values
+            if image_grid_thw is not None:
+                gen_inputs["image_grid_thw"] = image_grid_thw
+            return self.base_model.generate(**gen_inputs, **generate_kwargs)
+
+        gen_inputs = {"inputs_embeds": inputs_embeds}
+        if attention_mask is not None:
+            gen_inputs["attention_mask"] = attention_mask
+        return self.base_model.generate(**gen_inputs, **generate_kwargs)

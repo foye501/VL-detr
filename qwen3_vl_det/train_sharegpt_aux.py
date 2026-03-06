@@ -25,6 +25,7 @@ from qwen3_vl_det.modeling import (
 )
 from qwen3_vl_det.train_sharegpt import (
     BOX_SUPERVISION_CHOICES,
+    DET_QUERY_TOKEN,
     _extract_image,
     cxcywh_norm_to_xyxy_abs,
     extract_gt_boxes_from_example,
@@ -92,6 +93,8 @@ class TrainAuxArgs:
     lm_box_output_order: str = "yxyx"  # xyxy | yxyx
     lm_count_first: bool = True
     lm_append_box_instruction: bool = True
+    inject_det_queries_to_lm: bool = False
+    detach_det_queries_for_lm: bool = False
     seed: int = 7
     hf_token: str = ""
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -184,6 +187,8 @@ def parse_args() -> TrainAuxArgs:
     p.add_argument("--lm-count-last", dest="lm_count_first", action="store_false")
     p.add_argument("--lm-append-box-instruction", dest="lm_append_box_instruction", action="store_true")
     p.add_argument("--no-lm-append-box-instruction", dest="lm_append_box_instruction", action="store_false")
+    p.add_argument("--inject-det-queries-to-lm", action="store_true")
+    p.add_argument("--detach-det-queries-for-lm", action="store_true")
     p.add_argument("--seed", type=int, default=TrainAuxArgs.seed)
     p.add_argument("--hf-token", default=TrainAuxArgs.hf_token)
     p.add_argument("--device", default=TrainAuxArgs.device)
@@ -214,6 +219,8 @@ class ShareGptAuxCollator:
         lm_box_output_order: str,
         lm_count_first: bool,
         lm_append_box_instruction: bool,
+        inject_det_queries_to_lm: bool,
+        num_queries: int,
         assistant_only_loss: bool,
     ) -> None:
         self.processor = processor
@@ -229,7 +236,18 @@ class ShareGptAuxCollator:
         self.lm_box_output_order = lm_box_output_order
         self.lm_count_first = bool(lm_count_first)
         self.lm_append_box_instruction = bool(lm_append_box_instruction)
+        self.inject_det_queries_to_lm = bool(inject_det_queries_to_lm)
+        self.num_queries = int(num_queries)
         self.assistant_only_loss = assistant_only_loss
+        self.query_token_id = -1
+        if self.inject_det_queries_to_lm:
+            vocab = self.processor.tokenizer.get_vocab()
+            if DET_QUERY_TOKEN not in vocab:
+                raise ValueError(
+                    f"{DET_QUERY_TOKEN} is missing in tokenizer vocab while "
+                    "--inject-det-queries-to-lm is enabled."
+                )
+            self.query_token_id = int(self.processor.tokenizer.convert_tokens_to_ids(DET_QUERY_TOKEN))
 
     def _format_box_for_lm(self, xyxy_abs: list[float], width: int, height: int) -> list[float | int]:
         x1, y1, x2, y2 = [float(v) for v in xyxy_abs]
@@ -327,6 +345,9 @@ class ShareGptAuxCollator:
             )
 
             user_text = user_text.replace("<image>", "").strip()
+            if self.inject_det_queries_to_lm:
+                query_text = " ".join([DET_QUERY_TOKEN] * max(self.num_queries, 1))
+                user_text = f"{user_text}\n{query_text}"
             if self.lm_append_box_instruction and lm_mode_used == "box_count":
                 user_text = f"{user_text}\n{self._box_format_instruction()}"
             user_msg = {
@@ -390,6 +411,8 @@ class ShareGptAuxCollator:
         labels = inputs["input_ids"].clone()
         if "attention_mask" in inputs:
             labels[inputs["attention_mask"] == 0] = -100
+        if self.inject_det_queries_to_lm and self.query_token_id >= 0:
+            labels[inputs["input_ids"] == self.query_token_id] = -100
         if self.assistant_only_loss:
             if self.use_vision:
                 prompt_inputs = self.processor(
@@ -448,10 +471,31 @@ def main() -> None:
             "or adjust transformers version, then rerun."
         )
 
+    det_query_token_id = None
+    added_det_query_tokens = 0
+    if args.inject_det_queries_to_lm:
+        proc_tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else tokenizer
+        vocab = proc_tokenizer.get_vocab()
+        if DET_QUERY_TOKEN not in vocab:
+            added_det_query_tokens = int(
+                proc_tokenizer.add_special_tokens({"additional_special_tokens": [DET_QUERY_TOKEN]})
+            )
+        det_query_token_id = int(proc_tokenizer.convert_tokens_to_ids(DET_QUERY_TOKEN))
+        tokenizer = proc_tokenizer
+        if hasattr(processor, "tokenizer"):
+            processor.tokenizer = proc_tokenizer
+        print(
+            f"DETR query injection enabled: token={DET_QUERY_TOKEN} "
+            f"id={det_query_token_id} added={added_det_query_tokens}"
+        )
+
     image_token_id = args.image_token_id if args.image_token_id >= 0 else None
     branch_cfg = AuxDetrBranchConfig(
         image_token_id=image_token_id,
         strict_vision_memory=bool(args.strict_vision_memory),
+        inject_det_queries_to_lm=bool(args.inject_det_queries_to_lm),
+        det_query_token_id=det_query_token_id,
+        detach_det_queries_for_lm=bool(args.detach_det_queries_for_lm),
     )
     model = Qwen3VLAuxDetrAdapter.from_pretrained(
         args.model_name,
@@ -460,6 +504,9 @@ def main() -> None:
         trust_remote_code=True,
         dtype=torch.bfloat16 if args.device.startswith("cuda") else torch.float32,
     )
+    if added_det_query_tokens > 0:
+        model.base_model.resize_token_embeddings(len(tokenizer))
+        print(f"Resized token embeddings to {len(tokenizer)}")
     model.hungarian_cfg = HungarianLossConfig(
         class_cost=args.class_cost,
         bbox_cost=args.bbox_cost,
@@ -567,6 +614,8 @@ def main() -> None:
         lm_box_output_order=args.lm_box_output_order,
         lm_count_first=args.lm_count_first,
         lm_append_box_instruction=args.lm_append_box_instruction,
+        inject_det_queries_to_lm=args.inject_det_queries_to_lm,
+        num_queries=args.num_queries,
         assistant_only_loss=args.assistant_only_loss,
     )
     loader = DataLoader(

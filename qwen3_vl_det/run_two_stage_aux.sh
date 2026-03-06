@@ -85,6 +85,9 @@ FREEZE_VISION_BACKBONE="${FREEZE_VISION_BACKBONE:-0}"
 STRICT_VISION_MEMORY="${STRICT_VISION_MEMORY:-1}"
 ASSISTANT_ONLY_LOSS="${ASSISTANT_ONLY_LOSS:-1}"
 MERGE_LORA_ON_SAVE="${MERGE_LORA_ON_SAVE:-1}"
+INJECT_DET_TO_LM_STAGE1="${INJECT_DET_TO_LM_STAGE1:-0}"
+INJECT_DET_TO_LM_STAGE2="${INJECT_DET_TO_LM_STAGE2:-1}"
+DETACH_DET_QUERIES_FOR_LM="${DETACH_DET_QUERIES_FOR_LM:-0}"
 
 mkdir -p "${STAGE1_DIR}" "${STAGE2_DIR}"
 
@@ -149,6 +152,22 @@ else
   common_train_args+=(--no-merge-lora-on-save)
 fi
 
+stage1_fusion_args=()
+if [[ "${INJECT_DET_TO_LM_STAGE1}" == "1" ]]; then
+  stage1_fusion_args+=(--inject-det-queries-to-lm)
+  if [[ "${DETACH_DET_QUERIES_FOR_LM}" == "1" ]]; then
+    stage1_fusion_args+=(--detach-det-queries-for-lm)
+  fi
+fi
+
+stage2_fusion_args=()
+if [[ "${INJECT_DET_TO_LM_STAGE2}" == "1" ]]; then
+  stage2_fusion_args+=(--inject-det-queries-to-lm)
+  if [[ "${DETACH_DET_QUERIES_FOR_LM}" == "1" ]]; then
+    stage2_fusion_args+=(--detach-det-queries-for-lm)
+  fi
+fi
+
 echo "== Stage 1: DETR Warmup =="
 stage1_cmd=(
   python -m qwen3_vl_det.train_sharegpt_aux
@@ -159,6 +178,7 @@ stage1_cmd=(
   --lr "${LR_STAGE1}"
   --lm-weight "${LM_WEIGHT_STAGE1}"
   --det-weight "${DET_WEIGHT_STAGE1}"
+  "${stage1_fusion_args[@]}"
   "${common_train_args[@]}"
 )
 printf '%q ' "${stage1_cmd[@]}"; echo
@@ -175,6 +195,7 @@ stage2_cmd=(
   --lr "${LR_STAGE2}"
   --lm-weight "${LM_WEIGHT_STAGE2}"
   --det-weight "${DET_WEIGHT_STAGE2}"
+  "${stage2_fusion_args[@]}"
   "${common_train_args[@]}"
 )
 printf '%q ' "${stage2_cmd[@]}"; echo

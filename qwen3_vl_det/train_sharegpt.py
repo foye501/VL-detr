@@ -486,6 +486,8 @@ def _extract_boxes_by_field(
     field_name: str,
     width: int,
     height: int,
+    coord_mode: str = "auto",
+    coord_order: str = "auto",
 ) -> Optional[torch.Tensor]:
     if field_name not in example or example[field_name] is None:
         return None
@@ -516,8 +518,8 @@ def _extract_boxes_by_field(
         t.tolist(),
         width=width,
         height=height,
-        coord_mode="auto",
-        coord_order="auto",
+        coord_mode=coord_mode,
+        coord_order=coord_order,
     )
 
 
@@ -526,9 +528,18 @@ def _extract_from_candidates(
     width: int,
     height: int,
     field_names: list[str],
+    coord_mode: str = "auto",
+    coord_order: str = "auto",
 ) -> Optional[torch.Tensor]:
     for name in field_names:
-        boxes = _extract_boxes_by_field(example, name, width=width, height=height)
+        boxes = _extract_boxes_by_field(
+            example,
+            name,
+            width=width,
+            height=height,
+            coord_mode=coord_mode,
+            coord_order=coord_order,
+        )
         if boxes is not None:
             return boxes
     return None
@@ -584,6 +595,8 @@ def extract_gt_boxes_from_example(
             width=width,
             height=height,
             field_names=all_fields,
+            coord_mode=coord_mode,
+            coord_order=coord_order,
         )
         if all_boxes is not None:
             return all_boxes
@@ -593,12 +606,16 @@ def extract_gt_boxes_from_example(
             width=width,
             height=height,
             field_names=target_fields,
+            coord_mode=coord_mode,
+            coord_order=coord_order,
         )
         distractor_boxes = _extract_from_candidates(
             example,
             width=width,
             height=height,
             field_names=distractor_fields,
+            coord_mode=coord_mode,
+            coord_order=coord_order,
         )
         if target_boxes is not None and distractor_boxes is not None:
             if target_boxes.numel() == 0:
@@ -615,6 +632,8 @@ def extract_gt_boxes_from_example(
         width=width,
         height=height,
         field_names=target_fields,
+        coord_mode=coord_mode,
+        coord_order=coord_order,
     )
     if target_boxes is not None:
         return target_boxes
@@ -625,6 +644,8 @@ def extract_gt_boxes_from_example(
             width=width,
             height=height,
             field_names=all_fields,
+            coord_mode=coord_mode,
+            coord_order=coord_order,
         )
         if all_boxes is not None:
             return all_boxes

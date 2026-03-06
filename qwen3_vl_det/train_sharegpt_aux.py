@@ -90,6 +90,8 @@ class TrainAuxArgs:
     lm_box_ratio: float = 0.5  # used only for mixed
     lm_box_output_mode: str = "norm1000"  # absolute | norm1000 | norm01
     lm_box_output_order: str = "yxyx"  # xyxy | yxyx
+    lm_count_first: bool = True
+    lm_append_box_instruction: bool = True
     seed: int = 7
     hf_token: str = ""
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -178,6 +180,10 @@ def parse_args() -> TrainAuxArgs:
         choices=["xyxy", "yxyx"],
         default=TrainAuxArgs.lm_box_output_order,
     )
+    p.add_argument("--lm-count-first", dest="lm_count_first", action="store_true")
+    p.add_argument("--lm-count-last", dest="lm_count_first", action="store_false")
+    p.add_argument("--lm-append-box-instruction", dest="lm_append_box_instruction", action="store_true")
+    p.add_argument("--no-lm-append-box-instruction", dest="lm_append_box_instruction", action="store_false")
     p.add_argument("--seed", type=int, default=TrainAuxArgs.seed)
     p.add_argument("--hf-token", default=TrainAuxArgs.hf_token)
     p.add_argument("--device", default=TrainAuxArgs.device)
@@ -185,6 +191,8 @@ def parse_args() -> TrainAuxArgs:
         assistant_only_loss=TrainAuxArgs.assistant_only_loss,
         merge_lora_on_save=TrainAuxArgs.merge_lora_on_save,
         strict_vision_memory=TrainAuxArgs.strict_vision_memory,
+        lm_count_first=TrainAuxArgs.lm_count_first,
+        lm_append_box_instruction=TrainAuxArgs.lm_append_box_instruction,
     )
     ns = p.parse_args()
     return TrainAuxArgs(**vars(ns))
@@ -204,6 +212,8 @@ class ShareGptAuxCollator:
         lm_box_ratio: float,
         lm_box_output_mode: str,
         lm_box_output_order: str,
+        lm_count_first: bool,
+        lm_append_box_instruction: bool,
         assistant_only_loss: bool,
     ) -> None:
         self.processor = processor
@@ -217,6 +227,8 @@ class ShareGptAuxCollator:
         self.lm_box_ratio = max(0.0, min(1.0, float(lm_box_ratio)))
         self.lm_box_output_mode = lm_box_output_mode
         self.lm_box_output_order = lm_box_output_order
+        self.lm_count_first = bool(lm_count_first)
+        self.lm_append_box_instruction = bool(lm_append_box_instruction)
         self.assistant_only_loss = assistant_only_loss
 
     def _format_box_for_lm(self, xyxy_abs: list[float], width: int, height: int) -> list[float | int]:
@@ -250,27 +262,42 @@ class ShareGptAuxCollator:
         lm_target_boxes: torch.Tensor,
         width: int,
         height: int,
-    ) -> str:
+    ) -> tuple[str, str]:
         mode = self.lm_target_mode
         if mode == "mixed":
             mode = "box_count" if random.random() < self.lm_box_ratio else "count_only"
         if mode == "dataset":
-            return dataset_assistant_text
+            return dataset_assistant_text, mode
 
         count = int(lm_target_boxes.shape[0])
         if mode == "count_only":
-            return f"Total count: {count}"
+            return f"Total count: {count}", mode
 
         # box_count
         if count <= 0:
-            return "Total count: 0"
+            return "Total count: 0", mode
         xyxy = cxcywh_norm_to_xyxy_abs(lm_target_boxes, width=width, height=height)
         lines: list[str] = []
+        if self.lm_count_first:
+            lines.append(f"Total count: {count}")
         for b in xyxy.tolist():
             vals = self._format_box_for_lm(b, width=width, height=height)
             lines.append(f"<box> [{vals[0]}, {vals[1]}, {vals[2]}, {vals[3]}] </box>")
-        lines.append(f"Total count: {count}")
-        return "\n".join(lines)
+        if not self.lm_count_first:
+            lines.append(f"Total count: {count}")
+        return "\n".join(lines), mode
+
+    def _box_format_instruction(self) -> str:
+        coord_desc = {
+            "absolute": "absolute pixel coordinates",
+            "norm1000": "0-1000 normalized coordinates",
+            "norm01": "0-1 normalized coordinates",
+        }.get(self.lm_box_output_mode, self.lm_box_output_mode)
+        order_desc = " [y1, x1, y2, x2]" if self.lm_box_output_order == "yxyx" else " [x1, y1, x2, y2]"
+        return (
+            "Please output one target box per line in the format "
+            f"<box>{order_desc}</box> using {coord_desc}, and include 'Total count: N'."
+        )
 
     def __call__(self, batch: list[dict[str, Any]]) -> dict[str, Any]:
         texts = []
@@ -292,7 +319,7 @@ class ShareGptAuxCollator:
                 coord_order=self.box_coord_order,
                 box_supervision_source=self.lm_box_source,
             )
-            assistant_text = self._assistant_text_from_mode(
+            assistant_text, lm_mode_used = self._assistant_text_from_mode(
                 dataset_assistant_text=assistant_text_dataset,
                 lm_target_boxes=lm_target_boxes,
                 width=width,
@@ -300,6 +327,8 @@ class ShareGptAuxCollator:
             )
 
             user_text = user_text.replace("<image>", "").strip()
+            if self.lm_append_box_instruction and lm_mode_used == "box_count":
+                user_text = f"{user_text}\n{self._box_format_instruction()}"
             user_msg = {
                 "role": "user",
                 "content": [
@@ -536,6 +565,8 @@ def main() -> None:
         lm_box_ratio=args.lm_box_ratio,
         lm_box_output_mode=args.lm_box_output_mode,
         lm_box_output_order=args.lm_box_output_order,
+        lm_count_first=args.lm_count_first,
+        lm_append_box_instruction=args.lm_append_box_instruction,
         assistant_only_loss=args.assistant_only_loss,
     )
     loader = DataLoader(

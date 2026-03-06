@@ -85,6 +85,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lm-max-new-tokens", type=int, default=256)
     p.add_argument("--eval-lm-generation", dest="eval_lm_generation", action="store_true")
     p.add_argument("--no-eval-lm-generation", dest="eval_lm_generation", action="store_false")
+    p.add_argument("--lm-box-parse-mode", choices=["auto", "absolute", "norm1000", "norm01"], default="auto")
+    p.add_argument("--lm-box-parse-order", choices=["auto", "xyxy", "yxyx"], default="auto")
     p.add_argument("--output-json", default="qwen3_vl_det/eval_sharegpt_aux.json")
     p.set_defaults(eval_lm_generation=True)
     return p.parse_args()
@@ -334,6 +336,8 @@ def main() -> None:
     ckpt_mode = str(train_args.get("box_coord_mode", "")).lower()
     ckpt_order = str(train_args.get("box_coord_order", "")).lower()
     ckpt_source = str(train_args.get("box_supervision_source", "")).lower()
+    ckpt_lm_mode = str(train_args.get("lm_box_output_mode", "")).lower()
+    ckpt_lm_order = str(train_args.get("lm_box_output_order", "")).lower()
     effective_mode = args.box_coord_mode
     effective_order = args.box_coord_order
     effective_source = args.box_supervision_source
@@ -344,10 +348,21 @@ def main() -> None:
     if args.box_supervision_source == "all" and ckpt_source in BOX_SUPERVISION_CHOICES:
         # Mirror train-time default unless user explicitly overrides.
         effective_source = ckpt_source
+    effective_lm_parse_mode = args.lm_box_parse_mode
+    effective_lm_parse_order = args.lm_box_parse_order
+    if effective_lm_parse_mode == "auto" and ckpt_lm_mode in ("absolute", "norm1000", "norm01"):
+        effective_lm_parse_mode = ckpt_lm_mode
+    if effective_lm_parse_order == "auto" and ckpt_lm_order in ("xyxy", "yxyx"):
+        effective_lm_parse_order = ckpt_lm_order
     print(
         f"Eval coord mode/order/source: requested=({args.box_coord_mode},{args.box_coord_order},{args.box_supervision_source}) "
         f"checkpoint=({ckpt_mode or 'n/a'},{ckpt_order or 'n/a'},{ckpt_source or 'n/a'}) "
         f"used=({effective_mode},{effective_order},{effective_source})"
+    )
+    print(
+        f"Eval LM-box parse mode/order: requested=({args.lm_box_parse_mode},{args.lm_box_parse_order}) "
+        f"checkpoint=({ckpt_lm_mode or 'n/a'},{ckpt_lm_order or 'n/a'}) "
+        f"used=({effective_lm_parse_mode},{effective_lm_parse_order})"
     )
 
     rows: list[EvalRow] = []
@@ -453,8 +468,8 @@ def main() -> None:
                 lm_text,
                 width=w,
                 height=h,
-                coord_mode="auto",
-                coord_order="auto",
+                coord_mode=effective_lm_parse_mode,
+                coord_order=effective_lm_parse_order,
             )
             lm_xyxy = cxcywh_to_xyxy_abs(lm_boxes, width=w, height=h)
             lm_pred_count_boxes = int(lm_boxes.shape[0])
@@ -558,6 +573,8 @@ def main() -> None:
         "box_coord_mode_used": effective_mode,
         "box_coord_order_used": effective_order,
         "box_supervision_source_used": effective_source,
+        "lm_box_parse_mode_used": effective_lm_parse_mode,
+        "lm_box_parse_order_used": effective_lm_parse_order,
         "bucket_thresholds": {
             "easy_max": args.easy_max,
             "medium_max": args.medium_max,

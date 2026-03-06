@@ -55,6 +55,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lm-max-new-tokens", type=int, default=256)
     p.add_argument("--eval-lm-generation", dest="eval_lm_generation", action="store_true")
     p.add_argument("--no-eval-lm-generation", dest="eval_lm_generation", action="store_false")
+    p.add_argument("--lm-box-parse-mode", choices=["auto", "absolute", "norm1000", "norm01"], default="auto")
+    p.add_argument("--lm-box-parse-order", choices=["auto", "xyxy", "yxyx"], default="auto")
     p.set_defaults(eval_lm_generation=True)
     return p.parse_args()
 
@@ -187,6 +189,14 @@ def main() -> None:
     if os.path.exists(train_args_path):
         with open(train_args_path, "r", encoding="utf-8") as f:
             train_args = json.load(f)
+    ckpt_lm_mode = str(train_args.get("lm_box_output_mode", "")).lower()
+    ckpt_lm_order = str(train_args.get("lm_box_output_order", "")).lower()
+    effective_lm_parse_mode = args.lm_box_parse_mode
+    effective_lm_parse_order = args.lm_box_parse_order
+    if effective_lm_parse_mode == "auto" and ckpt_lm_mode in ("absolute", "norm1000", "norm01"):
+        effective_lm_parse_mode = ckpt_lm_mode
+    if effective_lm_parse_order == "auto" and ckpt_lm_order in ("xyxy", "yxyx"):
+        effective_lm_parse_order = ckpt_lm_order
 
     tokenizer_path = ckpt_dir if os.path.exists(os.path.join(ckpt_dir, "tokenizer_config.json")) else args.model_name
     if not tokenizer_path:
@@ -310,8 +320,8 @@ def main() -> None:
             lm_generated_text,
             width=w,
             height=h,
-            coord_mode="auto",
-            coord_order="auto",
+            coord_mode=effective_lm_parse_mode,
+            coord_order=effective_lm_parse_order,
         )
         lm_xyxy = cxcywh_to_xyxy_abs(lm_boxes, width=w, height=h)
 
@@ -454,6 +464,8 @@ def main() -> None:
         "lm_generation": {
             "enabled": bool(args.eval_lm_generation),
             "max_new_tokens": int(args.lm_max_new_tokens),
+            "box_parse_mode_used": effective_lm_parse_mode,
+            "box_parse_order_used": effective_lm_parse_order,
             "text": lm_generated_text,
         },
         "settings": {
@@ -477,6 +489,11 @@ def main() -> None:
     print(f"Pred soft count DETR (sum probs): {soft_count:.2f}")
     print(f"Pred count LM text: {lm_count_text if lm_count_text is not None else 'n/a'}")
     print(f"Pred count LM parsed boxes: {int(lm_boxes.shape[0])}")
+    print(
+        f"LM box parse mode/order: requested=({args.lm_box_parse_mode},{args.lm_box_parse_order}) "
+        f"checkpoint=({ckpt_lm_mode or 'n/a'},{ckpt_lm_order or 'n/a'}) "
+        f"used=({effective_lm_parse_mode},{effective_lm_parse_order})"
+    )
     print(f"Image size: {w}x{h}")
     print(
         f"Box coord mode: requested={args.box_coord_mode}, checkpoint={ckpt_mode or 'n/a'}, "

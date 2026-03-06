@@ -48,6 +48,7 @@ MAX_STEPS_STAGE2="${MAX_STEPS_STAGE2:-0}"
 MAX_SAMPLES="${MAX_SAMPLES:-1000}"
 START_INDEX="${START_INDEX:-3000}"
 SAMPLE_INDEX="${SAMPLE_INDEX:-3200}"
+MAX_LENGTH="${MAX_LENGTH:-4096}"
 
 BOX_MODE="${BOX_MODE:-norm1000}"
 BOX_ORDER="${BOX_ORDER:-yxyx}"
@@ -73,6 +74,9 @@ DETR_BOX_SOURCE="${DETR_BOX_SOURCE:-target}"       # target|all
 LM_BOX_RATIO="${LM_BOX_RATIO:-0.5}"                # for mixed only
 LM_BOX_OUTPUT_MODE="${LM_BOX_OUTPUT_MODE:-norm1000}"  # absolute|norm1000|norm01
 LM_BOX_OUTPUT_ORDER="${LM_BOX_OUTPUT_ORDER:-yxyx}"    # xyxy|yxyx
+LM_COUNT_FIRST="${LM_COUNT_FIRST:-1}"
+LM_APPEND_BOX_INSTRUCTION="${LM_APPEND_BOX_INSTRUCTION:-1}"
+LM_MAX_NEW_TOKENS="${LM_MAX_NEW_TOKENS:-768}"
 
 # LoRA/vision config
 USE_LORA="${USE_LORA:-1}"
@@ -90,6 +94,7 @@ common_train_args=(
   --num-queries "${NUM_QUERIES}"
   --batch-size "${BATCH_SIZE}"
   --grad-accum-steps "${GRAD_ACCUM}"
+  --max-length "${MAX_LENGTH}"
   --box-coord-mode "${BOX_MODE}"
   --box-coord-order "${BOX_ORDER}"
   --box-supervision-source "${DETR_BOX_SOURCE}"
@@ -127,6 +132,16 @@ if [[ "${ASSISTANT_ONLY_LOSS}" == "1" ]]; then
   common_train_args+=(--assistant-only-loss)
 else
   common_train_args+=(--full-seq-loss)
+fi
+if [[ "${LM_COUNT_FIRST}" == "1" ]]; then
+  common_train_args+=(--lm-count-first)
+else
+  common_train_args+=(--lm-count-last)
+fi
+if [[ "${LM_APPEND_BOX_INSTRUCTION}" == "1" ]]; then
+  common_train_args+=(--lm-append-box-instruction)
+else
+  common_train_args+=(--no-lm-append-box-instruction)
 fi
 if [[ "${MERGE_LORA_ON_SAVE}" == "1" ]]; then
   common_train_args+=(--merge-lora-on-save)
@@ -180,7 +195,7 @@ eval_cmd=(
   --box-coord-mode "${BOX_MODE}"
   --box-coord-order "${BOX_ORDER}"
   --box-supervision-source "${DETR_BOX_SOURCE}"
-  --lm-max-new-tokens 256
+  --lm-max-new-tokens "${LM_MAX_NEW_TOKENS}"
   --require-vision
   --output-json "${eval_json}"
   --save-overlays
@@ -205,7 +220,7 @@ one_cmd=(
   --box-coord-mode "${BOX_MODE}"
   --box-coord-order "${BOX_ORDER}"
   --box-supervision-source "${DETR_BOX_SOURCE}"
-  --lm-max-new-tokens 256
+  --lm-max-new-tokens "${LM_MAX_NEW_TOKENS}"
   --require-vision
   --annotate-scores
   --output-image "${STAGE2_DIR}/eval_one_${SAMPLE_INDEX}.png"

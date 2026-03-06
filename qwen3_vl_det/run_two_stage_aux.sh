@@ -88,6 +88,13 @@ MERGE_LORA_ON_SAVE="${MERGE_LORA_ON_SAVE:-1}"
 INJECT_DET_TO_LM_STAGE1="${INJECT_DET_TO_LM_STAGE1:-0}"
 INJECT_DET_TO_LM_STAGE2="${INJECT_DET_TO_LM_STAGE2:-1}"
 DETACH_DET_QUERIES_FOR_LM="${DETACH_DET_QUERIES_FOR_LM:-0}"
+USE_DINO_FUSION="${USE_DINO_FUSION:-0}"
+DINO_MODEL_NAME="${DINO_MODEL_NAME:-facebook/dinov2-base}"
+DINO_TRAINABLE="${DINO_TRAINABLE:-0}"
+DINO_DROP_CLS_TOKEN="${DINO_DROP_CLS_TOKEN:-1}"
+DINO_CROSS_ATTN_HEADS="${DINO_CROSS_ATTN_HEADS:-8}"
+DINO_CROSS_ATTN_DROPOUT="${DINO_CROSS_ATTN_DROPOUT:-0.0}"
+DINO_GATE_INIT="${DINO_GATE_INIT:-0.1}"
 
 mkdir -p "${STAGE1_DIR}" "${STAGE2_DIR}"
 
@@ -150,6 +157,23 @@ if [[ "${MERGE_LORA_ON_SAVE}" == "1" ]]; then
   common_train_args+=(--merge-lora-on-save)
 else
   common_train_args+=(--no-merge-lora-on-save)
+fi
+if [[ "${USE_DINO_FUSION}" == "1" ]]; then
+  common_train_args+=(
+    --use-dino-fusion
+    --dino-model-name "${DINO_MODEL_NAME}"
+    --dino-cross-attn-heads "${DINO_CROSS_ATTN_HEADS}"
+    --dino-cross-attn-dropout "${DINO_CROSS_ATTN_DROPOUT}"
+    --dino-gate-init "${DINO_GATE_INIT}"
+  )
+  if [[ "${DINO_TRAINABLE}" == "1" ]]; then
+    common_train_args+=(--dino-trainable)
+  fi
+  if [[ "${DINO_DROP_CLS_TOKEN}" == "1" ]]; then
+    common_train_args+=(--dino-drop-cls-token)
+  else
+    common_train_args+=(--keep-dino-cls-token)
+  fi
 fi
 
 stage1_fusion_args=()

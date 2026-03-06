@@ -8,6 +8,7 @@ from typing import Any, Optional
 import torch
 import torch.nn as nn
 import transformers
+from transformers import AutoModel
 from transformers import AutoModelForCausalLM
 
 try:
@@ -37,6 +38,7 @@ Qwen3VLForConditionalGeneration = _optional_transformers_class(
 )
 Qwen2_5_VLForConditionalGeneration = _optional_transformers_class("Qwen2_5_VLForConditionalGeneration")
 Qwen2VLForConditionalGeneration = _optional_transformers_class("Qwen2VLForConditionalGeneration")
+Dinov2Model = _optional_transformers_class("Dinov2Model")
 
 from .hungarian import HungarianLossConfig, detr_hungarian_loss
 
@@ -60,6 +62,13 @@ class AuxDetrBranchConfig:
     inject_det_queries_to_lm: bool = False
     det_query_token_id: Optional[int] = None
     detach_det_queries_for_lm: bool = False
+    use_dino_fusion: bool = False
+    dino_model_name: str = "facebook/dinov2-base"
+    dino_drop_cls_token: bool = True
+    dino_trainable: bool = False
+    dino_cross_attn_heads: int = 8
+    dino_cross_attn_dropout: float = 0.0
+    dino_gate_init: float = 0.1
 
 
 class Qwen3VLDetrAdapter(nn.Module):
@@ -290,10 +299,83 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
         self.box_head = nn.Linear(hidden_size, 4)
         if self.obj_head.bias is not None:
             nn.init.constant_(self.obj_head.bias, -2.0)
+
+        # Optional DINOv2 branch for instance-aware fusion into Qwen visual memory.
+        self.dino_model: Optional[nn.Module] = None
+        self.dino_proj: Optional[nn.Linear] = None
+        self.dino_q_ln: Optional[nn.LayerNorm] = None
+        self.dino_kv_ln: Optional[nn.LayerNorm] = None
+        self.dino_q_to_d_attn: Optional[nn.MultiheadAttention] = None
+        self.dino_gate_mlp: Optional[nn.Sequential] = None
+        self.dino_fuse_ln: Optional[nn.LayerNorm] = None
+        self.dino_fuse_ffn_ln: Optional[nn.LayerNorm] = None
+        self.dino_fuse_ffn: Optional[nn.Sequential] = None
+        self.dino_alpha = nn.Parameter(torch.tensor(float(self.branch_cfg.dino_gate_init)))
+        if self.branch_cfg.use_dino_fusion:
+            self._init_dino_fusion()
+
         self.hungarian_cfg = hungarian_cfg or HungarianLossConfig()
         self.loss_cfg = loss_cfg or AdapterLossConfig()
         self._warned_visual_fallback = False
         self._warned_lm_fusion_fail = False
+        self._warned_dino_missing_inputs = False
+
+    def _init_dino_fusion(self) -> None:
+        model_name = str(self.branch_cfg.dino_model_name).strip()
+        if not model_name:
+            raise ValueError("branch_cfg.use_dino_fusion=True requires branch_cfg.dino_model_name.")
+
+        dino = None
+        load_errors: list[str] = []
+        loaders: list[Any] = []
+        if Dinov2Model is not None:
+            loaders.append(Dinov2Model)
+        loaders.append(AutoModel)
+        for loader in loaders:
+            try:
+                dino = loader.from_pretrained(model_name)
+                break
+            except Exception as exc:  # pragma: no cover - model/env dependent
+                load_errors.append(f"{getattr(loader, '__name__', str(loader))}: {exc}")
+        if dino is None:
+            raise RuntimeError(
+                "Failed to load DINO model for fusion. "
+                f"model_name={model_name}. Errors:\n" + "\n".join(load_errors)
+            )
+
+        dino_hidden = int(getattr(getattr(dino, "config", None), "hidden_size", 0))
+        if dino_hidden <= 0:
+            raise ValueError("Could not infer DINO hidden size from config.hidden_size.")
+
+        self.dino_model = dino
+        self.dino_proj = nn.Linear(dino_hidden, self.hidden_size)
+        self.dino_q_ln = nn.LayerNorm(self.hidden_size)
+        self.dino_kv_ln = nn.LayerNorm(self.hidden_size)
+        self.dino_q_to_d_attn = nn.MultiheadAttention(
+            embed_dim=self.hidden_size,
+            num_heads=int(self.branch_cfg.dino_cross_attn_heads),
+            dropout=float(self.branch_cfg.dino_cross_attn_dropout),
+            batch_first=True,
+        )
+        self.dino_gate_mlp = nn.Sequential(
+            nn.Linear(self.hidden_size * 2, self.hidden_size),
+            nn.GELU(),
+            nn.Linear(self.hidden_size, self.hidden_size),
+        )
+        self.dino_fuse_ln = nn.LayerNorm(self.hidden_size)
+        self.dino_fuse_ffn_ln = nn.LayerNorm(self.hidden_size)
+        self.dino_fuse_ffn = nn.Sequential(
+            nn.Linear(self.hidden_size, self.hidden_size * 4),
+            nn.GELU(),
+            nn.Linear(self.hidden_size * 4, self.hidden_size),
+        )
+        self.set_dino_trainable(bool(self.branch_cfg.dino_trainable))
+
+    def set_dino_trainable(self, trainable: bool) -> None:
+        if self.dino_model is None:
+            return
+        for p in self.dino_model.parameters():
+            p.requires_grad = bool(trainable)
 
     @classmethod
     def from_pretrained(
@@ -645,6 +727,79 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
                 coords[b, :n] = sample_coords[:n]
         return coords
 
+    def _extract_dino_tokens(self, dino_pixel_values: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        if self.dino_model is None or dino_pixel_values is None or not torch.is_tensor(dino_pixel_values):
+            return None
+        outputs = self.dino_model(
+            pixel_values=dino_pixel_values,
+            output_hidden_states=False,
+            return_dict=True,
+        )
+        states = getattr(outputs, "last_hidden_state", None)
+        if not torch.is_tensor(states) or states.dim() != 3:
+            return None
+        if bool(self.branch_cfg.dino_drop_cls_token) and states.shape[1] > 1:
+            states = states[:, 1:, :]
+        return states
+
+    def _fuse_qwen_memory_with_dino(
+        self,
+        memory: torch.Tensor,
+        dino_pixel_values: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if self.dino_model is None or not bool(self.branch_cfg.use_dino_fusion):
+            return memory
+        dino_tokens = self._extract_dino_tokens(dino_pixel_values=dino_pixel_values)
+        if dino_tokens is None:
+            if not self._warned_dino_missing_inputs:
+                print(
+                    "WARNING: DINO fusion is enabled but dino_pixel_values are missing/invalid; "
+                    "running DETR branch with Qwen visual memory only."
+                )
+                self._warned_dino_missing_inputs = True
+            return memory
+        if dino_tokens.shape[0] != memory.shape[0]:
+            if not self._warned_dino_missing_inputs:
+                print(
+                    "WARNING: DINO fusion batch mismatch "
+                    f"(dino={int(dino_tokens.shape[0])}, memory={int(memory.shape[0])}); "
+                    "running DETR branch with Qwen visual memory only."
+                )
+                self._warned_dino_missing_inputs = True
+            return memory
+
+        if self.dino_proj is None:
+            return memory
+        proj_dtype = self.dino_proj.weight.dtype
+        dino_tokens = self.dino_proj(dino_tokens.to(dtype=proj_dtype))
+
+        # Run fusion layers in their parameter dtype, then cast back to memory dtype.
+        if self.dino_q_to_d_attn is None or self.dino_gate_mlp is None:
+            return memory
+        attn_dtype = self.dino_q_to_d_attn.in_proj_weight.dtype
+        q = memory.to(dtype=attn_dtype)
+        d = dino_tokens.to(dtype=attn_dtype)
+        if self.dino_q_ln is not None:
+            q = self.dino_q_ln(q)
+        if self.dino_kv_ln is not None:
+            d = self.dino_kv_ln(d)
+        d2q, _ = self.dino_q_to_d_attn(query=q, key=d, value=d, need_weights=False)
+
+        gate_in = torch.cat([q, d2q], dim=-1)
+        gate = torch.sigmoid(self.dino_gate_mlp(gate_in))
+        fused = q + (self.dino_alpha.to(dtype=q.dtype) * gate * d2q)
+        if self.dino_fuse_ln is not None:
+            fused = self.dino_fuse_ln(fused)
+        if self.dino_fuse_ffn is not None:
+            ff = fused
+            if self.dino_fuse_ffn_ln is not None:
+                ff = self.dino_fuse_ffn_ln(ff)
+            fused = fused + self.dino_fuse_ffn(ff)
+
+        if fused.dtype != memory.dtype:
+            fused = fused.to(memory.dtype)
+        return fused
+
     def _decode_queries(self, memory: torch.Tensor, memory_mask: torch.Tensor) -> torch.Tensor:
         bsz = memory.shape[0]
         queries = self.det_query_embed.weight.unsqueeze(0).expand(bsz, -1, -1)  # [B, Q, H]
@@ -711,6 +866,7 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
           **base_inputs: input_ids, labels, pixel_values, image_grid_thw, ...
         """
         first_inputs = dict(base_inputs)
+        dino_pixel_values = first_inputs.pop("dino_pixel_values", None)
         if self.branch_cfg.inject_det_queries_to_lm:
             # LM loss will be computed from a fused second pass after DET query injection.
             first_inputs.pop("labels", None)
@@ -757,6 +913,10 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
                 if pos.dtype != memory.dtype:
                     pos = pos.to(memory.dtype)
                 memory = memory + pos
+            memory = self._fuse_qwen_memory_with_dino(
+                memory=memory,
+                dino_pixel_values=dino_pixel_values,
+            )
             query_states = self._decode_queries(memory=memory, memory_mask=memory_mask)
             obj_logits = self.obj_head(query_states).squeeze(-1)  # [B, Q]
             box_pred = torch.sigmoid(self.box_head(query_states))  # [B, Q, 4]
@@ -794,6 +954,7 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
                 second_inputs.pop("input_ids", None)
                 second_inputs.pop("pixel_values", None)
                 second_inputs.pop("image_grid_thw", None)
+                second_inputs.pop("dino_pixel_values", None)
                 second_inputs["inputs_embeds"] = inputs_embeds
                 try:
                     fused_outputs = self.base_model(
@@ -834,6 +995,7 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         pixel_values: Optional[torch.Tensor] = None,
         image_grid_thw: Optional[torch.Tensor] = None,
+        dino_pixel_values: Optional[torch.Tensor] = None,
         **generate_kwargs: Any,
     ) -> torch.Tensor:
         """Generate text using DETR query-state injection into LM prompt embeddings."""
@@ -874,6 +1036,10 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
             if pos.dtype != memory.dtype:
                 pos = pos.to(memory.dtype)
             memory = memory + pos
+        memory = self._fuse_qwen_memory_with_dino(
+            memory=memory,
+            dino_pixel_values=dino_pixel_values,
+        )
         query_states = self._decode_queries(memory=memory, memory_mask=memory_mask)
         inputs_embeds, injected = self._inject_det_queries_into_inputs_embeds(
             input_ids=input_ids,

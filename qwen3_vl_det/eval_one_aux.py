@@ -11,7 +11,7 @@ from typing import Any
 
 import torch
 from PIL import Image, ImageDraw
-from transformers import AutoTokenizer
+from transformers import AutoImageProcessor, AutoTokenizer
 
 from qwen3_vl_det.modeling import AuxDetrBranchConfig, Qwen3VLAuxDetrAdapter
 from qwen3_vl_det.train_sharegpt import (
@@ -243,6 +243,13 @@ def main() -> None:
         print("WARNING: adapter.pt not found; using randomly initialized adapter heads.")
     model.to(args.device)
     model.eval()
+    dino_processor = None
+    if bool(getattr(branch_cfg, "use_dino_fusion", False)):
+        dino_model_name = str(getattr(branch_cfg, "dino_model_name", "")).strip()
+        if not dino_model_name:
+            raise RuntimeError("Checkpoint enables DINO fusion but has empty dino_model_name.")
+        dino_processor = AutoImageProcessor.from_pretrained(dino_model_name)
+        print(f"DINO fusion active: {dino_model_name}")
     if bool(getattr(branch_cfg, "inject_det_queries_to_lm", False)):
         print(
             "LM fusion mode: enabled "
@@ -284,10 +291,17 @@ def main() -> None:
             padding=True,
         )
     inputs = {k: v.to(args.device) if torch.is_tensor(v) else v for k, v in inputs.items()}
+    if dino_processor is not None:
+        dino_inputs = dino_processor(images=[img], return_tensors="pt")
+        if "pixel_values" not in dino_inputs:
+            raise RuntimeError("DINO processor did not return pixel_values at eval.")
+        inputs["dino_pixel_values"] = dino_inputs["pixel_values"].to(args.device)
     if "pixel_values" in inputs and torch.is_tensor(inputs["pixel_values"]):
         print(f"Processor pixel_values shape: {tuple(inputs['pixel_values'].shape)}")
     if "image_grid_thw" in inputs and torch.is_tensor(inputs["image_grid_thw"]):
         print(f"Processor image_grid_thw: {inputs['image_grid_thw'].detach().cpu().tolist()}")
+    if "dino_pixel_values" in inputs and torch.is_tensor(inputs["dino_pixel_values"]):
+        print(f"DINO pixel_values shape: {tuple(inputs['dino_pixel_values'].shape)}")
 
     with torch.no_grad():
         out = model(
@@ -295,6 +309,7 @@ def main() -> None:
             attention_mask=inputs.get("attention_mask"),
             pixel_values=inputs.get("pixel_values"),
             image_grid_thw=inputs.get("image_grid_thw"),
+            dino_pixel_values=inputs.get("dino_pixel_values"),
             det_enabled=True,
             return_det=True,
         )
@@ -316,6 +331,8 @@ def main() -> None:
             gen_kwargs["pixel_values"] = inputs.get("pixel_values")
         if "image_grid_thw" in inputs:
             gen_kwargs["image_grid_thw"] = inputs.get("image_grid_thw")
+        if "dino_pixel_values" in inputs:
+            gen_kwargs["dino_pixel_values"] = inputs.get("dino_pixel_values")
         with torch.no_grad():
             gen_ids = model.generate_with_det_injection(**gen_kwargs)
         gen_trimmed = [

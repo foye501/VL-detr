@@ -15,7 +15,7 @@ from typing import Any
 
 import torch
 from torch.utils.data import DataLoader
-from transformers import AutoTokenizer
+from transformers import AutoImageProcessor, AutoTokenizer
 
 from qwen3_vl_det.hungarian import HungarianLossConfig
 from qwen3_vl_det.modeling import (
@@ -95,6 +95,13 @@ class TrainAuxArgs:
     lm_append_box_instruction: bool = True
     inject_det_queries_to_lm: bool = False
     detach_det_queries_for_lm: bool = False
+    use_dino_fusion: bool = False
+    dino_model_name: str = "facebook/dinov2-base"
+    dino_trainable: bool = False
+    dino_drop_cls_token: bool = True
+    dino_cross_attn_heads: int = 8
+    dino_cross_attn_dropout: float = 0.0
+    dino_gate_init: float = 0.1
     seed: int = 7
     hf_token: str = ""
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -189,6 +196,14 @@ def parse_args() -> TrainAuxArgs:
     p.add_argument("--no-lm-append-box-instruction", dest="lm_append_box_instruction", action="store_false")
     p.add_argument("--inject-det-queries-to-lm", action="store_true")
     p.add_argument("--detach-det-queries-for-lm", action="store_true")
+    p.add_argument("--use-dino-fusion", action="store_true")
+    p.add_argument("--dino-model-name", default=TrainAuxArgs.dino_model_name)
+    p.add_argument("--dino-trainable", action="store_true")
+    p.add_argument("--dino-drop-cls-token", dest="dino_drop_cls_token", action="store_true")
+    p.add_argument("--keep-dino-cls-token", dest="dino_drop_cls_token", action="store_false")
+    p.add_argument("--dino-cross-attn-heads", type=int, default=TrainAuxArgs.dino_cross_attn_heads)
+    p.add_argument("--dino-cross-attn-dropout", type=float, default=TrainAuxArgs.dino_cross_attn_dropout)
+    p.add_argument("--dino-gate-init", type=float, default=TrainAuxArgs.dino_gate_init)
     p.add_argument("--seed", type=int, default=TrainAuxArgs.seed)
     p.add_argument("--hf-token", default=TrainAuxArgs.hf_token)
     p.add_argument("--device", default=TrainAuxArgs.device)
@@ -198,6 +213,7 @@ def parse_args() -> TrainAuxArgs:
         strict_vision_memory=TrainAuxArgs.strict_vision_memory,
         lm_count_first=TrainAuxArgs.lm_count_first,
         lm_append_box_instruction=TrainAuxArgs.lm_append_box_instruction,
+        dino_drop_cls_token=TrainAuxArgs.dino_drop_cls_token,
     )
     ns = p.parse_args()
     return TrainAuxArgs(**vars(ns))
@@ -207,8 +223,10 @@ class ShareGptAuxCollator:
     def __init__(
         self,
         processor,
+        dino_processor,
         max_length: int,
         use_vision: bool,
+        use_dino_fusion: bool,
         box_coord_mode: str,
         box_coord_order: str,
         box_supervision_source: str,
@@ -224,8 +242,10 @@ class ShareGptAuxCollator:
         assistant_only_loss: bool,
     ) -> None:
         self.processor = processor
+        self.dino_processor = dino_processor
         self.max_length = max_length
         self.use_vision = use_vision
+        self.use_dino_fusion = bool(use_dino_fusion)
         self.box_coord_mode = box_coord_mode
         self.box_coord_order = box_coord_order
         self.box_supervision_source = box_supervision_source
@@ -441,6 +461,13 @@ class ShareGptAuxCollator:
                     labels[b, :p_len_i] = -100
 
         out = dict(inputs)
+        if self.use_dino_fusion:
+            if self.dino_processor is None:
+                raise RuntimeError("DINO fusion enabled but dino_processor is not available.")
+            dino_inputs = self.dino_processor(images=images, return_tensors="pt")
+            if "pixel_values" not in dino_inputs:
+                raise RuntimeError("DINO processor did not return pixel_values.")
+            out["dino_pixel_values"] = dino_inputs["pixel_values"]
         out["labels"] = labels
         out["gt_boxes"] = gt_boxes
         return out
@@ -470,6 +497,10 @@ def main() -> None:
             "Vision processor failed to load. Install compatible vision deps (e.g., torchvision) "
             "or adjust transformers version, then rerun."
         )
+    dino_processor = None
+    if args.use_dino_fusion:
+        dino_processor = AutoImageProcessor.from_pretrained(args.dino_model_name)
+        print(f"DINO fusion enabled with model: {args.dino_model_name}")
 
     det_query_token_id = None
     added_det_query_tokens = 0
@@ -496,6 +527,13 @@ def main() -> None:
         inject_det_queries_to_lm=bool(args.inject_det_queries_to_lm),
         det_query_token_id=det_query_token_id,
         detach_det_queries_for_lm=bool(args.detach_det_queries_for_lm),
+        use_dino_fusion=bool(args.use_dino_fusion),
+        dino_model_name=str(args.dino_model_name),
+        dino_trainable=bool(args.dino_trainable),
+        dino_drop_cls_token=bool(args.dino_drop_cls_token),
+        dino_cross_attn_heads=int(args.dino_cross_attn_heads),
+        dino_cross_attn_dropout=float(args.dino_cross_attn_dropout),
+        dino_gate_init=float(args.dino_gate_init),
     )
     model = Qwen3VLAuxDetrAdapter.from_pretrained(
         args.model_name,
@@ -583,12 +621,22 @@ def main() -> None:
             vision_total += n_params
             if p.requires_grad:
                 vision_trainable += n_params
+    dino_total = 0
+    dino_trainable = 0
+    if getattr(model, "dino_model", None) is not None:
+        for p in model.dino_model.parameters():
+            n_params = int(p.numel())
+            dino_total += n_params
+            if p.requires_grad:
+                dino_trainable += n_params
     print(
         "Base model trainability: "
         f"trainable={base_trainable}/{base_total} "
         f"({(100.0 * base_trainable / max(base_total, 1)):.4f}%) "
         f"vision_trainable={vision_trainable}/{vision_total} "
         f"({(100.0 * vision_trainable / max(vision_total, 1)):.4f}%) "
+        f"dino_trainable={dino_trainable}/{dino_total} "
+        f"({(100.0 * dino_trainable / max(dino_total, 1)):.4f}%) "
         f"strict_vision_memory={bool(args.strict_vision_memory)}"
     )
     if bool(args.strict_vision_memory) and vision_trainable == 0:
@@ -602,8 +650,10 @@ def main() -> None:
 
     collator = ShareGptAuxCollator(
         processor=processor,
+        dino_processor=dino_processor,
         max_length=args.max_length,
         use_vision=use_vision,
+        use_dino_fusion=bool(args.use_dino_fusion),
         box_coord_mode=args.box_coord_mode,
         box_coord_order=args.box_coord_order,
         box_supervision_source=args.box_supervision_source,
@@ -644,7 +694,7 @@ def main() -> None:
                 "det_enabled": True,
                 "return_det": True,
             }
-            for k in ("attention_mask", "pixel_values", "image_grid_thw"):
+            for k in ("attention_mask", "pixel_values", "image_grid_thw", "dino_pixel_values"):
                 if k in batch and batch[k] is not None:
                     model_inputs[k] = batch[k]
 
@@ -692,8 +742,13 @@ def main() -> None:
     aux_only_state = {
         k: v
         for k, v in model.state_dict().items()
-        if not k.startswith("base_model.")
+        if (not k.startswith("base_model.")) and (not k.startswith("dino_model."))
     }
+    if bool(args.use_dino_fusion) and bool(args.dino_trainable):
+        print(
+            "WARNING: DINO was trainable but dino_model.* weights are excluded from adapter.pt. "
+            "Use frozen DINO for reproducible reloads, or add explicit DINO checkpoint saving."
+        )
     torch.save(
         {
             "adapter_type": "aux_visual",

@@ -960,6 +960,7 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
         if lm_loss is not None:
             result["lm_loss"] = lm_loss
         hidden = outputs.hidden_states[-1] if need_det else None
+        vision_outputs = outputs if need_det else None
         del outputs
 
         det_loss = None
@@ -975,7 +976,7 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
                 pixel_values=base_inputs.get("pixel_values"),
                 image_grid_thw=base_inputs.get("image_grid_thw"),
                 dino_pixel_values=dino_pixel_values,
-                outputs=outputs,
+                outputs=vision_outputs,
             )
             grid_coords = self._build_grid_coord_tensor(
                 memory=memory,

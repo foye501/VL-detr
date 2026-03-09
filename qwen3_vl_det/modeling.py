@@ -672,6 +672,7 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
         input_ids: torch.Tensor,
         pixel_values: Optional[torch.Tensor] = None,
         image_grid_thw: Optional[torch.Tensor] = None,
+        dino_pixel_values: Optional[torch.Tensor] = None,
         outputs: Optional[Any] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Extract visual memory for DETR.
@@ -704,11 +705,17 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
         if from_image_features is not None:
             return from_image_features
 
+        from_dino = self._extract_visual_memory_from_dino(
+            dino_pixel_values=dino_pixel_values,
+        )
+        if from_dino is not None:
+            return from_dino
+
         if self.branch_cfg.strict_vision_memory:
             raise RuntimeError(
                 "strict_vision_memory=True but no model-provided vision states were found "
                 "(expected one of: image_hidden_states / vision_hidden_states / visual_hidden_states "
-                "or get_image_features pooler_output). DETR memory fallback to language hidden states is disabled."
+                "or get_image_features outputs). DETR memory fallback to language hidden states is disabled."
             )
 
         image_token_id = self._infer_image_token_id(input_ids)
@@ -796,6 +803,20 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
         if bool(self.branch_cfg.dino_drop_cls_token) and states.shape[1] > 1:
             states = states[:, 1:, :]
         return states
+
+    def _extract_visual_memory_from_dino(
+        self,
+        dino_pixel_values: Optional[torch.Tensor],
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+        if not bool(self.branch_cfg.use_dino_fusion):
+            return None
+        dino_tokens = self._extract_dino_tokens(dino_pixel_values=dino_pixel_values)
+        if dino_tokens is None or self.dino_proj is None:
+            return None
+        proj_dtype = self.dino_proj.weight.dtype
+        memory = self.dino_proj(dino_tokens.to(dtype=proj_dtype))
+        mask = torch.ones(memory.shape[:2], device=memory.device, dtype=torch.bool)
+        return memory, mask
 
     def _fuse_qwen_memory_with_dino(
         self,
@@ -953,6 +974,7 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
                 input_ids=input_ids,
                 pixel_values=base_inputs.get("pixel_values"),
                 image_grid_thw=base_inputs.get("image_grid_thw"),
+                dino_pixel_values=dino_pixel_values,
                 outputs=outputs,
             )
             grid_coords = self._build_grid_coord_tensor(
@@ -1078,6 +1100,7 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
             input_ids=input_ids,
             pixel_values=pixel_values,
             image_grid_thw=image_grid_thw,
+            dino_pixel_values=dino_pixel_values,
             outputs=outputs,
         )
         grid_coords = self._build_grid_coord_tensor(

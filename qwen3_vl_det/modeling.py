@@ -906,7 +906,9 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
         if embed_layer is None:
             return None, 0
 
-        inputs_embeds = embed_layer(input_ids)
+        # Avoid in-place writes on a grad-tracked leaf tensor when replacing
+        # DET query token slots with visual query states.
+        inputs_embeds = embed_layer(input_ids).clone()
         injected = 0
         for b in range(int(input_ids.shape[0])):
             pos = torch.where(input_ids[b] == int(token_id))[0]

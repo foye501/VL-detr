@@ -40,6 +40,7 @@ Qwen2_5_VLProcessor = _optional_transformers_class("Qwen2_5_VLProcessor")
 Qwen2VLProcessor = _optional_transformers_class("Qwen2VLProcessor")
 
 DET_QUERY_TOKEN = "<|det_query|>"
+DINO_PATCH_TOKEN = "<|dino_patch|>"
 BOX_PATTERN = re.compile(
     r"<box>\s*\[\s*([-+]?\d*\.?\d+)\s*,\s*([-+]?\d*\.?\d+)\s*,\s*([-+]?\d*\.?\d+)\s*,\s*([-+]?\d*\.?\d+)\s*\]\s*</box>",
     flags=re.IGNORECASE,

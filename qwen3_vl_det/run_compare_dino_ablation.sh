@@ -3,7 +3,7 @@ set -euo pipefail
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 # Compare:
-# 1. LM-only DINO fusion (no DETR supervision, query injection on)
+# 1. LM-only direct DINO fusion (no DETR supervision, no DET queries)
 # 2. DINO fusion + auxiliary DETR two-stage training
 #
 # Usage:
@@ -15,7 +15,7 @@ DATASET_FROM_DISK="${DATASET_FROM_DISK:-}"
 SPLIT="${SPLIT:-train}"
 
 EXP_ROOT="${EXP_ROOT:-qwen3_vl_det/checkpoints_dino_compare}"
-BASELINE_DIR="${BASELINE_DIR:-${EXP_ROOT}/lm_only_dino}"
+BASELINE_DIR="${BASELINE_DIR:-${EXP_ROOT}/dino_direct_fusion}"
 MAIN_ROOT="${MAIN_ROOT:-${EXP_ROOT}/dino_plus_aux_detr}"
 MAIN_STAGE2_DIR="${MAIN_STAGE2_DIR:-${MAIN_ROOT}/stage2_joint}"
 
@@ -42,6 +42,7 @@ MAX_SAMPLES="${MAX_SAMPLES:-1000}"
 SAMPLE_INDEX="${SAMPLE_INDEX:-3200}"
 
 LM_TARGET_MODE="${LM_TARGET_MODE:-box_count}"
+BASELINE_LM_TARGET_MODE="${BASELINE_LM_TARGET_MODE:-count_only}"
 LM_BOX_SOURCE="${LM_BOX_SOURCE:-target}"
 DETR_BOX_SOURCE="${DETR_BOX_SOURCE:-target}"
 LM_BOX_OUTPUT_MODE="${LM_BOX_OUTPUT_MODE:-norm1000}"
@@ -60,6 +61,7 @@ MERGE_LORA_ON_SAVE="${MERGE_LORA_ON_SAVE:-1}"
 USE_DINO_FUSION="${USE_DINO_FUSION:-1}"
 DINO_MODEL_NAME="${DINO_MODEL_NAME:-facebook/dinov2-base}"
 DINO_TRAINABLE="${DINO_TRAINABLE:-0}"
+DINO_LM_NUM_TOKENS="${DINO_LM_NUM_TOKENS:-16}"
 
 NO_OBJECT_WEIGHT="${NO_OBJECT_WEIGHT:-0.1}"
 COUNT_LOSS_WEIGHT="${COUNT_LOSS_WEIGHT:-0.05}"
@@ -132,7 +134,7 @@ if [[ "${USE_DINO_FUSION}" == "1" ]]; then
   fi
 fi
 
-echo "== Baseline: LM-only DINO fusion =="
+echo "== Baseline: direct DINO fusion =="
 baseline_train_cmd=(
   python -m qwen3_vl_det.train_sharegpt_aux
   --model-name "${MODEL_NAME}"
@@ -142,8 +144,10 @@ baseline_train_cmd=(
   --lr "${LR_BASELINE}"
   --lm-weight 1.0
   --det-weight 0.0
-  --inject-det-queries-to-lm
   "${common_train_args[@]}"
+  --lm-target-mode "${BASELINE_LM_TARGET_MODE}"
+  --inject-dino-tokens-to-lm
+  --dino-lm-num-tokens "${DINO_LM_NUM_TOKENS}"
 )
 printf '%q ' "${baseline_train_cmd[@]}"; echo
 "${baseline_train_cmd[@]}"

@@ -26,6 +26,7 @@ from qwen3_vl_det.modeling import (
 from qwen3_vl_det.train_sharegpt import (
     BOX_SUPERVISION_CHOICES,
     DET_QUERY_TOKEN,
+    DINO_PATCH_TOKEN,
     _extract_image,
     cxcywh_norm_to_xyxy_abs,
     extract_gt_boxes_from_example,
@@ -95,6 +96,9 @@ class TrainAuxArgs:
     lm_append_box_instruction: bool = True
     inject_det_queries_to_lm: bool = False
     detach_det_queries_for_lm: bool = False
+    inject_dino_tokens_to_lm: bool = False
+    dino_lm_num_tokens: int = 16
+    detach_dino_tokens_for_lm: bool = False
     use_dino_fusion: bool = False
     dino_model_name: str = "facebook/dinov2-base"
     dino_trainable: bool = False
@@ -197,6 +201,9 @@ def parse_args() -> TrainAuxArgs:
     p.add_argument("--no-lm-append-box-instruction", dest="lm_append_box_instruction", action="store_false")
     p.add_argument("--inject-det-queries-to-lm", action="store_true")
     p.add_argument("--detach-det-queries-for-lm", action="store_true")
+    p.add_argument("--inject-dino-tokens-to-lm", action="store_true")
+    p.add_argument("--dino-lm-num-tokens", type=int, default=TrainAuxArgs.dino_lm_num_tokens)
+    p.add_argument("--detach-dino-tokens-for-lm", action="store_true")
     p.add_argument("--use-dino-fusion", action="store_true")
     p.add_argument("--dino-model-name", default=TrainAuxArgs.dino_model_name)
     p.add_argument("--dino-trainable", action="store_true")
@@ -242,6 +249,7 @@ class ShareGptAuxCollator:
         lm_count_first: bool,
         lm_append_box_instruction: bool,
         inject_det_queries_to_lm: bool,
+        inject_dino_tokens_to_lm: bool,
         num_queries: int,
         assistant_only_loss: bool,
     ) -> None:
@@ -261,9 +269,11 @@ class ShareGptAuxCollator:
         self.lm_count_first = bool(lm_count_first)
         self.lm_append_box_instruction = bool(lm_append_box_instruction)
         self.inject_det_queries_to_lm = bool(inject_det_queries_to_lm)
+        self.inject_dino_tokens_to_lm = bool(inject_dino_tokens_to_lm)
         self.num_queries = int(num_queries)
         self.assistant_only_loss = assistant_only_loss
         self.query_token_id = -1
+        self.dino_token_id = -1
         if self.inject_det_queries_to_lm:
             vocab = self.processor.tokenizer.get_vocab()
             if DET_QUERY_TOKEN not in vocab:
@@ -272,6 +282,8 @@ class ShareGptAuxCollator:
                     "--inject-det-queries-to-lm is enabled."
                 )
             self.query_token_id = int(self.processor.tokenizer.convert_tokens_to_ids(DET_QUERY_TOKEN))
+        if DINO_PATCH_TOKEN in self.processor.tokenizer.get_vocab():
+            self.dino_token_id = int(self.processor.tokenizer.convert_tokens_to_ids(DINO_PATCH_TOKEN))
 
     def _format_box_for_lm(self, xyxy_abs: list[float], width: int, height: int) -> list[float | int]:
         x1, y1, x2, y2 = [float(v) for v in xyxy_abs]
@@ -372,6 +384,9 @@ class ShareGptAuxCollator:
             if self.inject_det_queries_to_lm:
                 query_text = " ".join([DET_QUERY_TOKEN] * max(self.num_queries, 1))
                 user_text = f"{user_text}\n{query_text}"
+            if self.inject_dino_tokens_to_lm and self.dino_token_id >= 0:
+                dino_text = " ".join([DINO_PATCH_TOKEN] * max(self.num_queries, 1))
+                user_text = f"{user_text}\n{dino_text}"
             if self.lm_append_box_instruction and lm_mode_used == "box_count":
                 user_text = f"{user_text}\n{self._box_format_instruction()}"
             user_msg = {
@@ -437,6 +452,8 @@ class ShareGptAuxCollator:
             labels[inputs["attention_mask"] == 0] = -100
         if self.inject_det_queries_to_lm and self.query_token_id >= 0:
             labels[inputs["input_ids"] == self.query_token_id] = -100
+        if self.inject_dino_tokens_to_lm and self.dino_token_id >= 0:
+            labels[inputs["input_ids"] == self.dino_token_id] = -100
         if self.assistant_only_loss:
             if self.use_vision:
                 prompt_inputs = self.processor(
@@ -479,6 +496,10 @@ class ShareGptAuxCollator:
 
 def main() -> None:
     args = parse_args()
+    if args.inject_det_queries_to_lm and args.inject_dino_tokens_to_lm:
+        raise ValueError("Choose only one LM fusion path: DET queries or direct DINO tokens.")
+    if args.inject_dino_tokens_to_lm and not args.use_dino_fusion:
+        raise ValueError("--inject-dino-tokens-to-lm requires --use-dino-fusion.")
     os.makedirs(args.output_dir, exist_ok=True)
     torch.manual_seed(args.seed)
     random.seed(args.seed)
@@ -508,6 +529,8 @@ def main() -> None:
 
     det_query_token_id = None
     added_det_query_tokens = 0
+    dino_lm_token_id = None
+    added_dino_patch_tokens = 0
     if args.inject_det_queries_to_lm:
         proc_tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else tokenizer
         vocab = proc_tokenizer.get_vocab()
@@ -523,6 +546,22 @@ def main() -> None:
             f"DETR query injection enabled: token={DET_QUERY_TOKEN} "
             f"id={det_query_token_id} added={added_det_query_tokens}"
         )
+    if args.inject_dino_tokens_to_lm:
+        proc_tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else tokenizer
+        vocab = proc_tokenizer.get_vocab()
+        if DINO_PATCH_TOKEN not in vocab:
+            added_dino_patch_tokens = int(
+                proc_tokenizer.add_special_tokens({"additional_special_tokens": [DINO_PATCH_TOKEN]})
+            )
+        dino_lm_token_id = int(proc_tokenizer.convert_tokens_to_ids(DINO_PATCH_TOKEN))
+        tokenizer = proc_tokenizer
+        if hasattr(processor, "tokenizer"):
+            processor.tokenizer = proc_tokenizer
+        print(
+            f"DINO direct LM fusion enabled: token={DINO_PATCH_TOKEN} "
+            f"id={dino_lm_token_id} added={added_dino_patch_tokens} "
+            f"num_tokens={args.dino_lm_num_tokens}"
+        )
 
     image_token_id = args.image_token_id if args.image_token_id >= 0 else None
     branch_cfg = AuxDetrBranchConfig(
@@ -531,6 +570,10 @@ def main() -> None:
         inject_det_queries_to_lm=bool(args.inject_det_queries_to_lm),
         det_query_token_id=det_query_token_id,
         detach_det_queries_for_lm=bool(args.detach_det_queries_for_lm),
+        inject_dino_tokens_to_lm=bool(args.inject_dino_tokens_to_lm),
+        dino_lm_token_id=dino_lm_token_id,
+        dino_lm_num_tokens=int(args.dino_lm_num_tokens),
+        detach_dino_tokens_for_lm=bool(args.detach_dino_tokens_for_lm),
         use_dino_fusion=bool(args.use_dino_fusion),
         dino_model_name=str(args.dino_model_name),
         dino_trainable=bool(args.dino_trainable),
@@ -546,7 +589,7 @@ def main() -> None:
         trust_remote_code=True,
         dtype=torch.bfloat16 if args.device.startswith("cuda") else torch.float32,
     )
-    if added_det_query_tokens > 0:
+    if added_det_query_tokens > 0 or added_dino_patch_tokens > 0:
         model.base_model.resize_token_embeddings(len(tokenizer))
         print(f"Resized token embeddings to {len(tokenizer)}")
     model.hungarian_cfg = HungarianLossConfig(
@@ -688,7 +731,8 @@ def main() -> None:
         lm_count_first=args.lm_count_first,
         lm_append_box_instruction=args.lm_append_box_instruction,
         inject_det_queries_to_lm=args.inject_det_queries_to_lm,
-        num_queries=args.num_queries,
+        inject_dino_tokens_to_lm=args.inject_dino_tokens_to_lm,
+        num_queries=(args.dino_lm_num_tokens if args.inject_dino_tokens_to_lm else args.num_queries),
         assistant_only_loss=args.assistant_only_loss,
     )
     loader = DataLoader(
@@ -714,8 +758,8 @@ def main() -> None:
                 "input_ids": batch["input_ids"],
                 "labels": batch["labels"],
                 "gt_boxes": batch["gt_boxes"],
-                "det_enabled": True,
-                "return_det": True,
+                "det_enabled": bool(args.det_weight > 0.0 or args.inject_det_queries_to_lm),
+                "return_det": bool(args.det_weight > 0.0 or args.inject_det_queries_to_lm),
             }
             for k in ("attention_mask", "pixel_values", "image_grid_thw", "dino_pixel_values"):
                 if k in batch and batch[k] is not None:

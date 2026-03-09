@@ -7,6 +7,7 @@ from typing import Any, Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import transformers
 from transformers import AutoModel
 from transformers import AutoModelForCausalLM
@@ -62,6 +63,10 @@ class AuxDetrBranchConfig:
     inject_det_queries_to_lm: bool = False
     det_query_token_id: Optional[int] = None
     detach_det_queries_for_lm: bool = False
+    inject_dino_tokens_to_lm: bool = False
+    dino_lm_token_id: Optional[int] = None
+    dino_lm_num_tokens: int = 16
+    detach_dino_tokens_for_lm: bool = False
     use_dino_fusion: bool = False
     dino_model_name: str = "facebook/dinov2-base"
     dino_drop_cls_token: bool = True
@@ -310,6 +315,7 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
         self.dino_fuse_ln: Optional[nn.LayerNorm] = None
         self.dino_fuse_ffn_ln: Optional[nn.LayerNorm] = None
         self.dino_fuse_ffn: Optional[nn.Sequential] = None
+        self.dino_lm_ln: Optional[nn.LayerNorm] = None
         self.dino_alpha = nn.Parameter(torch.tensor(float(self.branch_cfg.dino_gate_init)))
         if self.branch_cfg.use_dino_fusion:
             self._init_dino_fusion()
@@ -369,6 +375,7 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
             nn.GELU(),
             nn.Linear(self.hidden_size * 4, self.hidden_size),
         )
+        self.dino_lm_ln = nn.LayerNorm(self.hidden_size)
         self.set_dino_trainable(bool(self.branch_cfg.dino_trainable))
 
     def set_dino_trainable(self, trainable: bool) -> None:
@@ -818,6 +825,29 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
         mask = torch.ones(memory.shape[:2], device=memory.device, dtype=torch.bool)
         return memory, mask
 
+    def _pool_dino_tokens_for_lm(
+        self,
+        dino_pixel_values: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        if not bool(self.branch_cfg.inject_dino_tokens_to_lm):
+            return None
+        dino_tokens = self._extract_dino_tokens(dino_pixel_values=dino_pixel_values)
+        if dino_tokens is None or self.dino_proj is None:
+            return None
+        num_tokens = max(int(self.branch_cfg.dino_lm_num_tokens), 1)
+        proj_dtype = self.dino_proj.weight.dtype
+        dino_tokens = self.dino_proj(dino_tokens.to(dtype=proj_dtype))
+        if dino_tokens.shape[1] != num_tokens:
+            pooled = F.adaptive_avg_pool1d(
+                dino_tokens.transpose(1, 2),
+                output_size=num_tokens,
+            ).transpose(1, 2)
+        else:
+            pooled = dino_tokens
+        if self.dino_lm_ln is not None:
+            pooled = self.dino_lm_ln(pooled)
+        return pooled
+
     def _fuse_qwen_memory_with_dino(
         self,
         memory: torch.Tensor,
@@ -891,15 +921,15 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
         )
         return self.det_norm(query_states)
 
-    def _inject_det_queries_into_inputs_embeds(
+    def _inject_token_features_into_inputs_embeds(
         self,
         input_ids: Optional[torch.Tensor],
-        query_states: torch.Tensor,
+        token_states: torch.Tensor,
+        token_id: Optional[int],
+        detach_features: bool = False,
     ) -> tuple[Optional[torch.Tensor], int]:
-        """Replace DET query-token embeddings with visual query states."""
         if input_ids is None or not torch.is_tensor(input_ids):
             return None, 0
-        token_id = self.branch_cfg.det_query_token_id
         if token_id is None:
             return None, 0
         embed_layer = self.base_model.get_input_embeddings()
@@ -914,19 +944,71 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
             pos = torch.where(input_ids[b] == int(token_id))[0]
             if pos.numel() == 0:
                 continue
-            n = min(int(pos.numel()), int(query_states.shape[1]))
+            n = min(int(pos.numel()), int(token_states.shape[1]))
             if n <= 0:
                 continue
-            q = query_states[b, :n]
-            if self.branch_cfg.detach_det_queries_for_lm:
-                q = q.detach()
-            if q.dtype != inputs_embeds.dtype:
-                q = q.to(inputs_embeds.dtype)
-            inputs_embeds[b, pos[:n]] = q
+            feats = token_states[b, :n]
+            if detach_features:
+                feats = feats.detach()
+            if feats.dtype != inputs_embeds.dtype:
+                feats = feats.to(inputs_embeds.dtype)
+            inputs_embeds[b, pos[:n]] = feats
             injected += n
         if injected <= 0:
             return None, 0
         return inputs_embeds, injected
+
+    def _inject_det_queries_into_inputs_embeds(
+        self,
+        input_ids: Optional[torch.Tensor],
+        query_states: torch.Tensor,
+    ) -> tuple[Optional[torch.Tensor], int]:
+        return self._inject_token_features_into_inputs_embeds(
+            input_ids=input_ids,
+            token_states=query_states,
+            token_id=self.branch_cfg.det_query_token_id,
+            detach_features=bool(self.branch_cfg.detach_det_queries_for_lm),
+        )
+
+    def _inject_dino_tokens_into_inputs_embeds(
+        self,
+        input_ids: Optional[torch.Tensor],
+        dino_pixel_values: Optional[torch.Tensor],
+    ) -> tuple[Optional[torch.Tensor], int]:
+        pooled = self._pool_dino_tokens_for_lm(dino_pixel_values=dino_pixel_values)
+        if pooled is None:
+            return None, 0
+        return self._inject_token_features_into_inputs_embeds(
+            input_ids=input_ids,
+            token_states=pooled,
+            token_id=self.branch_cfg.dino_lm_token_id,
+            detach_features=bool(self.branch_cfg.detach_dino_tokens_for_lm),
+        )
+
+    def _run_base_with_inputs_embeds(
+        self,
+        base_inputs: dict[str, Any],
+        inputs_embeds: torch.Tensor,
+        output_hidden_states: bool,
+    ) -> Any:
+        fused_inputs = dict(base_inputs)
+        fused_inputs.pop("input_ids", None)
+        fused_inputs["inputs_embeds"] = inputs_embeds
+        fused_inputs["output_hidden_states"] = output_hidden_states
+        fused_inputs["return_dict"] = True
+        fused_inputs["use_cache"] = False
+        try:
+            return self.base_model(**fused_inputs)
+        except Exception as exc:
+            fused_inputs.pop("pixel_values", None)
+            fused_inputs.pop("image_grid_thw", None)
+            if not self._warned_lm_fusion_fail:
+                print(
+                    "WARNING: visual-token LM fusion with pixel inputs failed; "
+                    f"retrying without pixel tensors. error={type(exc).__name__}: {exc}"
+                )
+                self._warned_lm_fusion_fail = True
+            return self.base_model(**fused_inputs)
 
     def forward(
         self,
@@ -946,18 +1028,41 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
         first_inputs = dict(base_inputs)
         dino_pixel_values = first_inputs.pop("dino_pixel_values", None)
         need_det = det_enabled and (gt_boxes is not None or return_det)
-        if self.branch_cfg.inject_det_queries_to_lm:
+        use_det_lm_fusion = bool(self.branch_cfg.inject_det_queries_to_lm)
+        use_dino_lm_fusion = bool(self.branch_cfg.inject_dino_tokens_to_lm) and not use_det_lm_fusion
+        if use_det_lm_fusion:
             # LM loss will be computed from a fused second pass after DET query injection.
             first_inputs.pop("labels", None)
+        if use_dino_lm_fusion:
+            dino_inputs_embeds, dino_injected = self._inject_dino_tokens_into_inputs_embeds(
+                input_ids=base_inputs.get("input_ids"),
+                dino_pixel_values=dino_pixel_values,
+            )
+            result_dino = {
+                "lm_dino_token_injected": bool(dino_injected > 0),
+                "lm_dino_token_injected_count": int(dino_injected),
+            }
+            if dino_inputs_embeds is not None:
+                first_inputs["inputs_embeds"] = dino_inputs_embeds
+        else:
+            result_dino = {}
         first_inputs["use_cache"] = False
 
-        outputs = self.base_model(
-            output_hidden_states=bool(need_det),
-            return_dict=True,
-            **first_inputs,
-        )
+        if use_dino_lm_fusion and first_inputs.get("inputs_embeds") is not None:
+            dino_inputs_embeds = first_inputs.pop("inputs_embeds")
+            outputs = self._run_base_with_inputs_embeds(
+                base_inputs={k: v for k, v in first_inputs.items() if k != "dino_pixel_values"},
+                inputs_embeds=dino_inputs_embeds,
+                output_hidden_states=bool(need_det),
+            )
+        else:
+            outputs = self.base_model(
+                output_hidden_states=bool(need_det),
+                return_dict=True,
+                **first_inputs,
+            )
 
-        result: dict[str, Any] = {}
+        result: dict[str, Any] = dict(result_dino)
         lm_loss = getattr(outputs, "loss", None)
         if lm_loss is not None:
             result["lm_loss"] = lm_loss
@@ -1015,7 +1120,7 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
                 result["det_stats"] = det_stats
 
         if (
-            self.branch_cfg.inject_det_queries_to_lm
+            use_det_lm_fusion
             and query_states is not None
             and ("labels" in base_inputs)
             and (base_inputs.get("labels") is not None)
@@ -1028,20 +1133,15 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
             result["lm_det_query_injected"] = bool(injected > 0)
             result["lm_det_query_injected_count"] = int(injected)
             if inputs_embeds is not None:
-                second_inputs = dict(base_inputs)
-                # Use injected embeddings as LM input. We avoid passing pixel tensors in
-                # this second pass to keep input path unambiguous.
-                second_inputs.pop("input_ids", None)
-                second_inputs.pop("pixel_values", None)
-                second_inputs.pop("image_grid_thw", None)
-                second_inputs.pop("dino_pixel_values", None)
-                second_inputs["use_cache"] = False
-                second_inputs["inputs_embeds"] = inputs_embeds
                 try:
-                    fused_outputs = self.base_model(
+                    fused_outputs = self._run_base_with_inputs_embeds(
+                        base_inputs={
+                            k: v
+                            for k, v in base_inputs.items()
+                            if k != "dino_pixel_values"
+                        },
+                        inputs_embeds=inputs_embeds,
                         output_hidden_states=False,
-                        return_dict=True,
-                        **second_inputs,
                     )
                     lm_loss = getattr(fused_outputs, "loss", lm_loss)
                     if lm_loss is not None:
@@ -1068,7 +1168,7 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
         return result
 
     @torch.no_grad()
-    def generate_with_det_injection(
+    def generate_with_visual_injection(
         self,
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
@@ -1077,8 +1177,8 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
         dino_pixel_values: Optional[torch.Tensor] = None,
         **generate_kwargs: Any,
     ) -> torch.Tensor:
-        """Generate text using DETR query-state injection into LM prompt embeddings."""
-        if not self.branch_cfg.inject_det_queries_to_lm:
+        """Generate text using configured visual-token injection into LM prompt embeddings."""
+        if not self.branch_cfg.inject_det_queries_to_lm and not self.branch_cfg.inject_dino_tokens_to_lm:
             gen_inputs: dict[str, Any] = {"input_ids": input_ids}
             if attention_mask is not None:
                 gen_inputs["attention_mask"] = attention_mask
@@ -1087,6 +1187,32 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
             if image_grid_thw is not None:
                 gen_inputs["image_grid_thw"] = image_grid_thw
             return self.base_model.generate(**gen_inputs, **generate_kwargs)
+
+        if self.branch_cfg.inject_dino_tokens_to_lm and not self.branch_cfg.inject_det_queries_to_lm:
+            inputs_embeds, injected = self._inject_dino_tokens_into_inputs_embeds(
+                input_ids=input_ids,
+                dino_pixel_values=dino_pixel_values,
+            )
+            if inputs_embeds is not None and injected > 0:
+                gen_inputs: dict[str, Any] = {"inputs_embeds": inputs_embeds}
+                if attention_mask is not None:
+                    gen_inputs["attention_mask"] = attention_mask
+                if pixel_values is not None:
+                    gen_inputs["pixel_values"] = pixel_values
+                if image_grid_thw is not None:
+                    gen_inputs["image_grid_thw"] = image_grid_thw
+                try:
+                    return self.base_model.generate(**gen_inputs, **generate_kwargs)
+                except Exception as exc:
+                    if not self._warned_lm_fusion_fail:
+                        print(
+                            "WARNING: DINO direct-fusion generate with pixel inputs failed; "
+                            f"retrying without pixel tensors. error={type(exc).__name__}: {exc}"
+                        )
+                        self._warned_lm_fusion_fail = True
+                    gen_inputs.pop("pixel_values", None)
+                    gen_inputs.pop("image_grid_thw", None)
+                    return self.base_model.generate(**gen_inputs, **generate_kwargs)
 
         outputs = self.base_model(
             input_ids=input_ids,
@@ -1138,4 +1264,38 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
         gen_inputs = {"inputs_embeds": inputs_embeds}
         if attention_mask is not None:
             gen_inputs["attention_mask"] = attention_mask
-        return self.base_model.generate(**gen_inputs, **generate_kwargs)
+        if pixel_values is not None:
+            gen_inputs["pixel_values"] = pixel_values
+        if image_grid_thw is not None:
+            gen_inputs["image_grid_thw"] = image_grid_thw
+        try:
+            return self.base_model.generate(**gen_inputs, **generate_kwargs)
+        except Exception as exc:
+            if not self._warned_lm_fusion_fail:
+                print(
+                    "WARNING: DETR-query generate with pixel inputs failed; "
+                    f"retrying without pixel tensors. error={type(exc).__name__}: {exc}"
+                )
+                self._warned_lm_fusion_fail = True
+            gen_inputs.pop("pixel_values", None)
+            gen_inputs.pop("image_grid_thw", None)
+            return self.base_model.generate(**gen_inputs, **generate_kwargs)
+
+    @torch.no_grad()
+    def generate_with_det_injection(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        pixel_values: Optional[torch.Tensor] = None,
+        image_grid_thw: Optional[torch.Tensor] = None,
+        dino_pixel_values: Optional[torch.Tensor] = None,
+        **generate_kwargs: Any,
+    ) -> torch.Tensor:
+        return self.generate_with_visual_injection(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+            dino_pixel_values=dino_pixel_values,
+            **generate_kwargs,
+        )

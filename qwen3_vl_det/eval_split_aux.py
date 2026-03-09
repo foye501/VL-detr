@@ -26,6 +26,7 @@ from qwen3_vl_det.modeling import AuxDetrBranchConfig, Qwen3VLAuxDetrAdapter
 from qwen3_vl_det.train_sharegpt import (
     BOX_SUPERVISION_CHOICES,
     DET_QUERY_TOKEN,
+    DINO_PATCH_TOKEN,
     _extract_image,
     extract_gt_boxes_from_example,
     extract_user_assistant_from_example,
@@ -313,6 +314,12 @@ def build_model_and_processor(args: argparse.Namespace):
             "LM fusion mode: enabled "
             f"(det_query_token_id={getattr(branch_cfg, 'det_query_token_id', None)})"
         )
+    if bool(getattr(branch_cfg, "inject_dino_tokens_to_lm", False)):
+        print(
+            "LM fusion mode: direct DINO "
+            f"(dino_lm_token_id={getattr(branch_cfg, 'dino_lm_token_id', None)}, "
+            f"num_tokens={getattr(branch_cfg, 'dino_lm_num_tokens', None)})"
+        )
     dino_processor = None
     if bool(getattr(branch_cfg, "use_dino_fusion", False)):
         dino_model_name = str(getattr(branch_cfg, "dino_model_name", "")).strip()
@@ -392,6 +399,13 @@ def main() -> None:
         ):
             query_text = " ".join([DET_QUERY_TOKEN] * max(int(args.num_queries), 1))
             user_text = f"{user_text}\n{query_text}"
+        if bool(getattr(model.branch_cfg, "inject_dino_tokens_to_lm", False)) and (
+            getattr(model.branch_cfg, "dino_lm_token_id", None) is not None
+        ):
+            dino_text = " ".join(
+                [DINO_PATCH_TOKEN] * max(int(getattr(model.branch_cfg, "dino_lm_num_tokens", 16)), 1)
+            )
+            user_text = f"{user_text}\n{dino_text}"
         chat_messages = [
             {
                 "role": "user",
@@ -480,7 +494,7 @@ def main() -> None:
             if "dino_pixel_values" in inputs:
                 gen_kwargs["dino_pixel_values"] = inputs.get("dino_pixel_values")
             with torch.no_grad():
-                gen_ids = model.generate_with_det_injection(**gen_kwargs)
+                gen_ids = model.generate_with_visual_injection(**gen_kwargs)
             gen_trimmed = [
                 (out_ids[len(in_ids) :] if out_ids.shape[0] > in_ids.shape[0] else out_ids)
                 for in_ids, out_ids in zip(inputs["input_ids"], gen_ids)

@@ -541,15 +541,29 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
         if pixel_values is None or not torch.is_tensor(pixel_values):
             return None
         candidate_models: list[Any] = []
-        if hasattr(self.base_model, "get_image_features"):
-            candidate_models.append(self.base_model)
-        if hasattr(self.base_model, "get_base_model"):
-            raw = self.base_model.get_base_model()
-            if raw is not None and raw is not self.base_model and hasattr(raw, "get_image_features"):
-                candidate_models.append(raw)
-        raw_model = getattr(self.base_model, "model", None)
-        if raw_model is not None and raw_model is not self.base_model and hasattr(raw_model, "get_image_features"):
-            candidate_models.append(raw_model)
+        visited: set[int] = set()
+        queue: list[Any] = [self.base_model]
+        while queue:
+            cur = queue.pop(0)
+            if cur is None:
+                continue
+            cur_id = id(cur)
+            if cur_id in visited:
+                continue
+            visited.add(cur_id)
+            if hasattr(cur, "get_image_features") and callable(getattr(cur, "get_image_features")):
+                candidate_models.append(cur)
+            next_objs = []
+            if hasattr(cur, "get_base_model"):
+                try:
+                    next_objs.append(cur.get_base_model())
+                except Exception:
+                    pass
+            for attr in ("model", "base_model"):
+                nxt = getattr(cur, attr, None)
+                if nxt is not None and nxt is not cur:
+                    next_objs.append(nxt)
+            queue.extend(next_objs)
 
         if not candidate_models:
             return None

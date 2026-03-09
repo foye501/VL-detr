@@ -540,42 +540,42 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
         """
         if pixel_values is None or not torch.is_tensor(pixel_values):
             return None
-        if not hasattr(self.base_model, "get_image_features"):
-            return None
-        try:
-            image_outputs = self.base_model.get_image_features(
-                pixel_values=pixel_values,
-                image_grid_thw=image_grid_thw,
-                return_dict=True,
-            )
-        except Exception:
+        candidate_models: list[Any] = []
+        if hasattr(self.base_model, "get_image_features"):
+            candidate_models.append(self.base_model)
+        if hasattr(self.base_model, "get_base_model"):
+            raw = self.base_model.get_base_model()
+            if raw is not None and raw is not self.base_model and hasattr(raw, "get_image_features"):
+                candidate_models.append(raw)
+        raw_model = getattr(self.base_model, "model", None)
+        if raw_model is not None and raw_model is not self.base_model and hasattr(raw_model, "get_image_features"):
+            candidate_models.append(raw_model)
+
+        if not candidate_models:
             return None
 
-        pooler = getattr(image_outputs, "pooler_output", None)
-        if pooler is None:
+        image_outputs = None
+        for m in candidate_models:
+            try:
+                image_outputs = m.get_image_features(
+                    pixel_values=pixel_values,
+                    image_grid_thw=image_grid_thw,
+                    return_dict=True,
+                )
+                break
+            except Exception:
+                continue
+        if image_outputs is None:
             return None
 
-        # Common case for Qwen3-VL: list[Tensor[Li, H]] per sample.
-        if isinstance(pooler, (list, tuple)) and len(pooler) > 0:
-            feats_list = []
-            for t in pooler:
-                if not torch.is_tensor(t):
-                    return None
-                if t.dim() == 1:
-                    if int(t.shape[0]) != hidden:
-                        return None
-                    t = t.unsqueeze(0)
-                if t.dim() != 2 or int(t.shape[-1]) != hidden:
-                    return None
-                feats_list.append(t)
+        def _pack_feature_list(feats_list: list[torch.Tensor]) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
             if not feats_list:
                 return None
-            bsz = len(feats_list)
             max_len = max(int(x.shape[0]) for x in feats_list)
             device = feats_list[0].device
             dtype = feats_list[0].dtype
-            memory = torch.zeros((bsz, max_len, hidden), device=device, dtype=dtype)
-            mask = torch.zeros((bsz, max_len), device=device, dtype=torch.bool)
+            memory = torch.zeros((len(feats_list), max_len, hidden), device=device, dtype=dtype)
+            mask = torch.zeros((len(feats_list), max_len), device=device, dtype=torch.bool)
             for b, x in enumerate(feats_list):
                 n = int(x.shape[0])
                 if n > 0:
@@ -583,31 +583,72 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
                     mask[b, :n] = True
             return memory, mask
 
-        # If already batched [B, L, H], use directly.
-        if torch.is_tensor(pooler) and pooler.dim() == 3 and int(pooler.shape[-1]) == hidden:
-            memory = pooler
-            mask = torch.ones(memory.shape[:2], device=memory.device, dtype=torch.bool)
-            return memory, mask
-
-        # If flattened [sumL, H], split by image placeholder counts.
-        if torch.is_tensor(pooler) and pooler.dim() == 2 and int(pooler.shape[-1]) == hidden:
-            image_token_id = self._infer_image_token_id(input_ids)
-            counts = []
-            for b in range(int(input_ids.shape[0])):
-                counts.append(int((input_ids[b] == image_token_id).sum().item()))
-            total = sum(counts)
-            if total <= 0 or int(pooler.shape[0]) < total:
+        def _as_sequence_tensor(t: torch.Tensor) -> Optional[torch.Tensor]:
+            if not torch.is_tensor(t):
                 return None
-            max_len = max(counts) if counts else 0
-            memory = pooler.new_zeros((int(input_ids.shape[0]), max_len, hidden))
-            mask = torch.zeros((int(input_ids.shape[0]), max_len), device=pooler.device, dtype=torch.bool)
-            offset = 0
-            for b, n in enumerate(counts):
-                if n > 0:
-                    memory[b, :n] = pooler[offset : offset + n]
-                    mask[b, :n] = True
-                    offset += n
-            return memory, mask
+            if t.dim() == 4 and int(t.shape[-1]) == hidden:
+                return t.reshape(int(t.shape[0]), -1, hidden)
+            if t.dim() == 3 and int(t.shape[-1]) == hidden:
+                return t
+            return None
+
+        candidates: list[Any] = []
+        if torch.is_tensor(image_outputs):
+            candidates.append(image_outputs)
+        else:
+            for attr in ("last_hidden_state", "pooler_output", "deepstack_features", "hidden_states"):
+                v = getattr(image_outputs, attr, None)
+                if v is not None:
+                    candidates.append(v)
+
+        for cand in candidates:
+            if isinstance(cand, (list, tuple)) and len(cand) > 0:
+                if torch.is_tensor(cand[-1]) and torch.is_tensor(cand[0]):
+                    # tuple(hidden_states) or list(deepstack_features): use the last/highest-level map
+                    seq = _as_sequence_tensor(cand[-1])
+                    if seq is not None:
+                        return seq, torch.ones(seq.shape[:2], device=seq.device, dtype=torch.bool)
+                feats_list = []
+                valid = True
+                for t in cand:
+                    if not torch.is_tensor(t):
+                        valid = False
+                        break
+                    if t.dim() == 1 and int(t.shape[0]) == hidden:
+                        t = t.unsqueeze(0)
+                    elif t.dim() == 3 and int(t.shape[-1]) == hidden and int(t.shape[0]) == 1:
+                        t = t.squeeze(0)
+                    if t.dim() != 2 or int(t.shape[-1]) != hidden:
+                        valid = False
+                        break
+                    feats_list.append(t)
+                if valid:
+                    packed = _pack_feature_list(feats_list)
+                    if packed is not None:
+                        return packed
+                continue
+
+            if torch.is_tensor(cand):
+                seq = _as_sequence_tensor(cand)
+                if seq is not None:
+                    return seq, torch.ones(seq.shape[:2], device=seq.device, dtype=torch.bool)
+                if cand.dim() == 2 and int(cand.shape[-1]) == hidden:
+                    image_token_id = self._infer_image_token_id(input_ids)
+                    counts = []
+                    for b in range(int(input_ids.shape[0])):
+                        counts.append(int((input_ids[b] == image_token_id).sum().item()))
+                    total = sum(counts)
+                    if total > 0 and int(cand.shape[0]) >= total:
+                        max_len = max(counts) if counts else 0
+                        memory = cand.new_zeros((int(input_ids.shape[0]), max_len, hidden))
+                        mask = torch.zeros((int(input_ids.shape[0]), max_len), device=cand.device, dtype=torch.bool)
+                        offset = 0
+                        for b, n in enumerate(counts):
+                            if n > 0:
+                                memory[b, :n] = cand[offset : offset + n]
+                                mask[b, :n] = True
+                                offset += n
+                        return memory, mask
 
         return None
 

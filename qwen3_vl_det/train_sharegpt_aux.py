@@ -102,6 +102,7 @@ class TrainAuxArgs:
     dino_cross_attn_heads: int = 8
     dino_cross_attn_dropout: float = 0.0
     dino_gate_init: float = 0.1
+    gradient_checkpointing: bool = True
     seed: int = 7
     hf_token: str = ""
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -204,6 +205,8 @@ def parse_args() -> TrainAuxArgs:
     p.add_argument("--dino-cross-attn-heads", type=int, default=TrainAuxArgs.dino_cross_attn_heads)
     p.add_argument("--dino-cross-attn-dropout", type=float, default=TrainAuxArgs.dino_cross_attn_dropout)
     p.add_argument("--dino-gate-init", type=float, default=TrainAuxArgs.dino_gate_init)
+    p.add_argument("--gradient-checkpointing", dest="gradient_checkpointing", action="store_true")
+    p.add_argument("--no-gradient-checkpointing", dest="gradient_checkpointing", action="store_false")
     p.add_argument("--seed", type=int, default=TrainAuxArgs.seed)
     p.add_argument("--hf-token", default=TrainAuxArgs.hf_token)
     p.add_argument("--device", default=TrainAuxArgs.device)
@@ -214,6 +217,7 @@ def parse_args() -> TrainAuxArgs:
         lm_count_first=TrainAuxArgs.lm_count_first,
         lm_append_box_instruction=TrainAuxArgs.lm_append_box_instruction,
         dino_drop_cls_token=TrainAuxArgs.dino_drop_cls_token,
+        gradient_checkpointing=TrainAuxArgs.gradient_checkpointing,
     )
     ns = p.parse_args()
     return TrainAuxArgs(**vars(ns))
@@ -644,6 +648,25 @@ def main() -> None:
             "WARNING: strict_vision_memory is enabled, but no vision parameters are trainable. "
             "DETR loss cannot improve the vision encoder in this configuration."
         )
+
+    if hasattr(model.base_model, "config") and getattr(model.base_model, "config", None) is not None:
+        try:
+            model.base_model.config.use_cache = False
+        except Exception:
+            pass
+    if args.gradient_checkpointing and hasattr(model.base_model, "gradient_checkpointing_enable"):
+        try:
+            model.base_model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        except TypeError:
+            model.base_model.gradient_checkpointing_enable()
+        except Exception:
+            pass
+        if hasattr(model.base_model, "enable_input_require_grads"):
+            try:
+                model.base_model.enable_input_require_grads()
+            except Exception:
+                pass
+        print("Gradient checkpointing enabled. Training cache disabled.")
 
     model.to(args.device)
     model.train()

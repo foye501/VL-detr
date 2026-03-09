@@ -943,32 +943,32 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
         """
         first_inputs = dict(base_inputs)
         dino_pixel_values = first_inputs.pop("dino_pixel_values", None)
+        need_det = det_enabled and (gt_boxes is not None or return_det)
         if self.branch_cfg.inject_det_queries_to_lm:
             # LM loss will be computed from a fused second pass after DET query injection.
             first_inputs.pop("labels", None)
+        first_inputs["use_cache"] = False
 
         outputs = self.base_model(
-            output_hidden_states=True,
+            output_hidden_states=bool(need_det),
             return_dict=True,
             **first_inputs,
         )
 
-        result: dict[str, Any] = {"base_outputs": outputs}
-        if hasattr(outputs, "logits"):
-            result["logits"] = outputs.logits
+        result: dict[str, Any] = {}
         lm_loss = getattr(outputs, "loss", None)
         if lm_loss is not None:
             result["lm_loss"] = lm_loss
+        hidden = outputs.hidden_states[-1] if need_det else None
+        del outputs
 
         det_loss = None
-        need_det = det_enabled and (gt_boxes is not None or return_det)
         query_states = None
         if need_det:
             input_ids = base_inputs.get("input_ids")
             if input_ids is None:
                 raise ValueError("input_ids is required for auxiliary DETR visual-token extraction.")
 
-            hidden = outputs.hidden_states[-1]
             memory, memory_mask = self._extract_visual_memory(
                 hidden_states=hidden,
                 input_ids=input_ids,
@@ -1032,6 +1032,7 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
                 second_inputs.pop("pixel_values", None)
                 second_inputs.pop("image_grid_thw", None)
                 second_inputs.pop("dino_pixel_values", None)
+                second_inputs["use_cache"] = False
                 second_inputs["inputs_embeds"] = inputs_embeds
                 try:
                     fused_outputs = self.base_model(
@@ -1039,12 +1040,10 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
                         return_dict=True,
                         **second_inputs,
                     )
-                    result["lm_fused_outputs"] = fused_outputs
-                    if hasattr(fused_outputs, "logits"):
-                        result["logits"] = fused_outputs.logits
                     lm_loss = getattr(fused_outputs, "loss", lm_loss)
                     if lm_loss is not None:
                         result["lm_loss"] = lm_loss
+                    del fused_outputs
                 except Exception as exc:
                     if not self._warned_lm_fusion_fail:
                         print(

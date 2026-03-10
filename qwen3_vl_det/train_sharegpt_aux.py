@@ -10,6 +10,7 @@ import argparse
 import json
 import os
 import random
+import re
 from dataclasses import asdict, dataclass
 from typing import Any
 
@@ -110,6 +111,8 @@ class TrainAuxArgs:
     debug_first_batch: bool = False
     debug_first_batch_generate: bool = True
     debug_first_batch_max_new_tokens: int = 128
+    log_lm_generate_every: int = 0
+    log_lm_generate_max_new_tokens: int = 128
     seed: int = 7
     hf_token: str = ""
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -221,6 +224,8 @@ def parse_args() -> TrainAuxArgs:
     p.add_argument("--debug-first-batch-generate", dest="debug_first_batch_generate", action="store_true")
     p.add_argument("--no-debug-first-batch-generate", dest="debug_first_batch_generate", action="store_false")
     p.add_argument("--debug-first-batch-max-new-tokens", type=int, default=TrainAuxArgs.debug_first_batch_max_new_tokens)
+    p.add_argument("--log-lm-generate-every", type=int, default=TrainAuxArgs.log_lm_generate_every)
+    p.add_argument("--log-lm-generate-max-new-tokens", type=int, default=TrainAuxArgs.log_lm_generate_max_new_tokens)
     p.add_argument("--seed", type=int, default=TrainAuxArgs.seed)
     p.add_argument("--hf-token", default=TrainAuxArgs.hf_token)
     p.add_argument("--device", default=TrainAuxArgs.device)
@@ -534,6 +539,60 @@ def _summarize_boxes(gt_boxes: list[torch.Tensor]) -> list[list[list[float]]]:
     return out
 
 
+def _extract_count_from_text(text: str) -> int | None:
+    patterns = [
+        r"total\s*count\s*[:=]\s*(-?\d+)",
+        r"count\s*[:=]\s*(-?\d+)",
+    ]
+    for pat in patterns:
+        m = re.search(pat, text, flags=re.IGNORECASE)
+        if m:
+            try:
+                return int(m.group(1))
+            except Exception:
+                pass
+    nums = re.findall(r"(?<![\d.])-?\d+(?![\d.])", text)
+    if len(nums) == 1:
+        try:
+            return int(nums[0])
+        except Exception:
+            return None
+    return None
+
+
+def _generate_lm_preview_text(
+    model: Qwen3VLAuxDetrAdapter,
+    processor,
+    batch_dev: dict[str, Any],
+    max_new_tokens: int,
+) -> tuple[str | None, int | None]:
+    tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+    gen_kwargs: dict[str, Any] = {
+        "input_ids": batch_dev["input_ids"][:1],
+        "max_new_tokens": int(max_new_tokens),
+        "do_sample": False,
+    }
+    for k in ("attention_mask", "pixel_values", "image_grid_thw", "dino_pixel_values"):
+        if k in batch_dev and torch.is_tensor(batch_dev[k]):
+            gen_kwargs[k] = batch_dev[k][:1]
+    was_training = model.training
+    model.eval()
+    try:
+        with torch.no_grad():
+            gen_ids = model.generate_with_visual_injection(**gen_kwargs)
+        prompt_len = int(gen_kwargs["input_ids"].shape[1])
+        trimmed = gen_ids[0, prompt_len:] if gen_ids.shape[1] > prompt_len else gen_ids[0]
+        text = tokenizer.decode(
+            trimmed.detach().cpu().tolist(),
+            skip_special_tokens=False,
+            clean_up_tokenization_spaces=False,
+        )
+        return text, _extract_count_from_text(text)
+    finally:
+        if was_training:
+            model.train()
+
+
 def _dump_first_batch_debug(
     args: TrainAuxArgs,
     model: Qwen3VLAuxDetrAdapter,
@@ -552,29 +611,12 @@ def _dump_first_batch_debug(
 
     pred_text = None
     if args.debug_first_batch_generate:
-        gen_kwargs: dict[str, Any] = {
-            "input_ids": batch_dev["input_ids"][:1],
-            "max_new_tokens": int(args.debug_first_batch_max_new_tokens),
-            "do_sample": False,
-        }
-        for k in ("attention_mask", "pixel_values", "image_grid_thw", "dino_pixel_values"):
-            if k in batch_dev and torch.is_tensor(batch_dev[k]):
-                gen_kwargs[k] = batch_dev[k][:1]
-        was_training = model.training
-        model.eval()
-        try:
-            with torch.no_grad():
-                gen_ids = model.generate_with_visual_injection(**gen_kwargs)
-            prompt_len = int(gen_kwargs["input_ids"].shape[1])
-            trimmed = gen_ids[0, prompt_len:] if gen_ids.shape[1] > prompt_len else gen_ids[0]
-            pred_text = tokenizer.decode(
-                trimmed.detach().cpu().tolist(),
-                skip_special_tokens=False,
-                clean_up_tokenization_spaces=False,
-            )
-        finally:
-            if was_training:
-                model.train()
+        pred_text, _ = _generate_lm_preview_text(
+            model=model,
+            processor=processor,
+            batch_dev=batch_dev,
+            max_new_tokens=int(args.debug_first_batch_max_new_tokens),
+        )
 
     det_summary: dict[str, Any] = {}
     if "det_obj_logits" in out and torch.is_tensor(out["det_obj_logits"]):
@@ -949,6 +991,18 @@ def main() -> None:
                 det_stats = out.get("det_stats", {})
                 pred_count = det_stats.get("pred_count_mean", -1.0)
                 gt_count = det_stats.get("gt_count_mean", -1.0)
+                lm_pred_count_text = None
+                lm_gt_count = None
+                lm_preview_text = None
+                if args.log_lm_generate_every > 0 and (global_step % args.log_lm_generate_every == 0):
+                    lm_preview_text, lm_pred_count_text = _generate_lm_preview_text(
+                        model=model,
+                        processor=processor,
+                        batch_dev=batch,
+                        max_new_tokens=int(args.log_lm_generate_max_new_tokens),
+                    )
+                    if batch_cpu.get("gt_boxes"):
+                        lm_gt_count = int(batch_cpu["gt_boxes"][0].shape[0])
                 print(
                     f"epoch={epoch} step={global_step} "
                     f"total={out['loss'].detach().item():.4f} "
@@ -956,6 +1010,13 @@ def main() -> None:
                     f"det={(det.detach().item() if det is not None else -1):.4f} "
                     f"pred_count={pred_count:.2f} gt_count={gt_count:.2f}"
                 )
+                if args.log_lm_generate_every > 0 and (global_step % args.log_lm_generate_every == 0):
+                    print(
+                        "lm_preview "
+                        f"pred_count={lm_pred_count_text if lm_pred_count_text is not None else 'n/a'} "
+                        f"gt_count={lm_gt_count if lm_gt_count is not None else 'n/a'} "
+                        f"text={json.dumps(lm_preview_text if lm_preview_text is not None else '')}"
+                    )
 
         if args.max_steps > 0 and global_step >= args.max_steps:
             break

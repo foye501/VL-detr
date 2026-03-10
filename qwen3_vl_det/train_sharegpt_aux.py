@@ -10,7 +10,6 @@ import argparse
 import json
 import os
 import random
-import re
 from dataclasses import asdict, dataclass
 from typing import Any
 
@@ -100,6 +99,8 @@ class TrainAuxArgs:
     inject_dino_tokens_to_lm: bool = False
     dino_lm_num_tokens: int = 16
     detach_dino_tokens_for_lm: bool = False
+    inject_fused_visual_tokens_to_lm: bool = False
+    detach_fused_visual_tokens_for_lm: bool = False
     use_dino_fusion: bool = False
     dino_model_name: str = "facebook/dinov2-base"
     dino_trainable: bool = False
@@ -111,8 +112,6 @@ class TrainAuxArgs:
     debug_first_batch: bool = False
     debug_first_batch_generate: bool = True
     debug_first_batch_max_new_tokens: int = 128
-    log_lm_generate_every: int = 0
-    log_lm_generate_max_new_tokens: int = 128
     seed: int = 7
     hf_token: str = ""
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -210,6 +209,8 @@ def parse_args() -> TrainAuxArgs:
     p.add_argument("--inject-dino-tokens-to-lm", action="store_true")
     p.add_argument("--dino-lm-num-tokens", type=int, default=TrainAuxArgs.dino_lm_num_tokens)
     p.add_argument("--detach-dino-tokens-for-lm", action="store_true")
+    p.add_argument("--inject-fused-visual-tokens-to-lm", action="store_true")
+    p.add_argument("--detach-fused-visual-tokens-for-lm", action="store_true")
     p.add_argument("--use-dino-fusion", action="store_true")
     p.add_argument("--dino-model-name", default=TrainAuxArgs.dino_model_name)
     p.add_argument("--dino-trainable", action="store_true")
@@ -224,8 +225,6 @@ def parse_args() -> TrainAuxArgs:
     p.add_argument("--debug-first-batch-generate", dest="debug_first_batch_generate", action="store_true")
     p.add_argument("--no-debug-first-batch-generate", dest="debug_first_batch_generate", action="store_false")
     p.add_argument("--debug-first-batch-max-new-tokens", type=int, default=TrainAuxArgs.debug_first_batch_max_new_tokens)
-    p.add_argument("--log-lm-generate-every", type=int, default=TrainAuxArgs.log_lm_generate_every)
-    p.add_argument("--log-lm-generate-max-new-tokens", type=int, default=TrainAuxArgs.log_lm_generate_max_new_tokens)
     p.add_argument("--seed", type=int, default=TrainAuxArgs.seed)
     p.add_argument("--hf-token", default=TrainAuxArgs.hf_token)
     p.add_argument("--device", default=TrainAuxArgs.device)
@@ -263,6 +262,7 @@ class ShareGptAuxCollator:
         lm_append_box_instruction: bool,
         inject_det_queries_to_lm: bool,
         inject_dino_tokens_to_lm: bool,
+        inject_fused_visual_tokens_to_lm: bool,
         num_queries: int,
         assistant_only_loss: bool,
     ) -> None:
@@ -283,6 +283,7 @@ class ShareGptAuxCollator:
         self.lm_append_box_instruction = bool(lm_append_box_instruction)
         self.inject_det_queries_to_lm = bool(inject_det_queries_to_lm)
         self.inject_dino_tokens_to_lm = bool(inject_dino_tokens_to_lm)
+        self.inject_fused_visual_tokens_to_lm = bool(inject_fused_visual_tokens_to_lm)
         self.num_queries = int(num_queries)
         self.assistant_only_loss = assistant_only_loss
         self.query_token_id = -1
@@ -399,7 +400,7 @@ class ShareGptAuxCollator:
             if self.inject_det_queries_to_lm:
                 query_text = " ".join([DET_QUERY_TOKEN] * max(self.num_queries, 1))
                 user_text = f"{user_text}\n{query_text}"
-            if self.inject_dino_tokens_to_lm and self.dino_token_id >= 0:
+            if (self.inject_dino_tokens_to_lm or self.inject_fused_visual_tokens_to_lm) and self.dino_token_id >= 0:
                 dino_text = " ".join([DINO_PATCH_TOKEN] * max(self.num_queries, 1))
                 user_text = f"{user_text}\n{dino_text}"
             if self.lm_append_box_instruction and lm_mode_used == "box_count":
@@ -469,7 +470,7 @@ class ShareGptAuxCollator:
             labels[inputs["attention_mask"] == 0] = -100
         if self.inject_det_queries_to_lm and self.query_token_id >= 0:
             labels[inputs["input_ids"] == self.query_token_id] = -100
-        if self.inject_dino_tokens_to_lm and self.dino_token_id >= 0:
+        if (self.inject_dino_tokens_to_lm or self.inject_fused_visual_tokens_to_lm) and self.dino_token_id >= 0:
             labels[inputs["input_ids"] == self.dino_token_id] = -100
         if self.assistant_only_loss:
             if self.use_vision:
@@ -539,60 +540,6 @@ def _summarize_boxes(gt_boxes: list[torch.Tensor]) -> list[list[list[float]]]:
     return out
 
 
-def _extract_count_from_text(text: str) -> int | None:
-    patterns = [
-        r"total\s*count\s*[:=]\s*(-?\d+)",
-        r"count\s*[:=]\s*(-?\d+)",
-    ]
-    for pat in patterns:
-        m = re.search(pat, text, flags=re.IGNORECASE)
-        if m:
-            try:
-                return int(m.group(1))
-            except Exception:
-                pass
-    nums = re.findall(r"(?<![\d.])-?\d+(?![\d.])", text)
-    if len(nums) == 1:
-        try:
-            return int(nums[0])
-        except Exception:
-            return None
-    return None
-
-
-def _generate_lm_preview_text(
-    model: Qwen3VLAuxDetrAdapter,
-    processor,
-    batch_dev: dict[str, Any],
-    max_new_tokens: int,
-) -> tuple[str | None, int | None]:
-    tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
-    gen_kwargs: dict[str, Any] = {
-        "input_ids": batch_dev["input_ids"][:1],
-        "max_new_tokens": int(max_new_tokens),
-        "do_sample": False,
-    }
-    for k in ("attention_mask", "pixel_values", "image_grid_thw", "dino_pixel_values"):
-        if k in batch_dev and torch.is_tensor(batch_dev[k]):
-            gen_kwargs[k] = batch_dev[k][:1]
-    was_training = model.training
-    model.eval()
-    try:
-        with torch.no_grad():
-            gen_ids = model.generate_with_visual_injection(**gen_kwargs)
-        prompt_len = int(gen_kwargs["input_ids"].shape[1])
-        trimmed = gen_ids[0, prompt_len:] if gen_ids.shape[1] > prompt_len else gen_ids[0]
-        text = tokenizer.decode(
-            trimmed.detach().cpu().tolist(),
-            skip_special_tokens=False,
-            clean_up_tokenization_spaces=False,
-        )
-        return text, _extract_count_from_text(text)
-    finally:
-        if was_training:
-            model.train()
-
-
 def _dump_first_batch_debug(
     args: TrainAuxArgs,
     model: Qwen3VLAuxDetrAdapter,
@@ -611,12 +558,29 @@ def _dump_first_batch_debug(
 
     pred_text = None
     if args.debug_first_batch_generate:
-        pred_text, _ = _generate_lm_preview_text(
-            model=model,
-            processor=processor,
-            batch_dev=batch_dev,
-            max_new_tokens=int(args.debug_first_batch_max_new_tokens),
-        )
+        gen_kwargs: dict[str, Any] = {
+            "input_ids": batch_dev["input_ids"][:1],
+            "max_new_tokens": int(args.debug_first_batch_max_new_tokens),
+            "do_sample": False,
+        }
+        for k in ("attention_mask", "pixel_values", "image_grid_thw", "dino_pixel_values"):
+            if k in batch_dev and torch.is_tensor(batch_dev[k]):
+                gen_kwargs[k] = batch_dev[k][:1]
+        was_training = model.training
+        model.eval()
+        try:
+            with torch.no_grad():
+                gen_ids = model.generate_with_visual_injection(**gen_kwargs)
+            prompt_len = int(gen_kwargs["input_ids"].shape[1])
+            trimmed = gen_ids[0, prompt_len:] if gen_ids.shape[1] > prompt_len else gen_ids[0]
+            pred_text = tokenizer.decode(
+                trimmed.detach().cpu().tolist(),
+                skip_special_tokens=False,
+                clean_up_tokenization_spaces=False,
+            )
+        finally:
+            if was_training:
+                model.train()
 
     det_summary: dict[str, Any] = {}
     if "det_obj_logits" in out and torch.is_tensor(out["det_obj_logits"]):
@@ -640,6 +604,7 @@ def _dump_first_batch_debug(
             "det_weight": args.det_weight,
             "inject_det_queries_to_lm": bool(args.inject_det_queries_to_lm),
             "inject_dino_tokens_to_lm": bool(args.inject_dino_tokens_to_lm),
+            "inject_fused_visual_tokens_to_lm": bool(args.inject_fused_visual_tokens_to_lm),
             "dino_lm_num_tokens": int(args.dino_lm_num_tokens),
             "use_dino_fusion": bool(args.use_dino_fusion),
             "strict_vision_memory": bool(args.strict_vision_memory),
@@ -681,6 +646,8 @@ def _dump_first_batch_debug(
             "det_summary": det_summary,
             "lm_dino_token_injected": out.get("lm_dino_token_injected"),
             "lm_dino_token_injected_count": out.get("lm_dino_token_injected_count"),
+            "lm_fused_visual_injected": out.get("lm_fused_visual_injected"),
+            "lm_fused_visual_injected_count": out.get("lm_fused_visual_injected_count"),
             "lm_det_query_injected": out.get("lm_det_query_injected"),
             "lm_det_query_injected_count": out.get("lm_det_query_injected_count"),
         },
@@ -693,10 +660,15 @@ def _dump_first_batch_debug(
 
 def main() -> None:
     args = parse_args()
-    if args.inject_det_queries_to_lm and args.inject_dino_tokens_to_lm:
-        raise ValueError("Choose only one LM fusion path: DET queries or direct DINO tokens.")
-    if args.inject_dino_tokens_to_lm and not args.use_dino_fusion:
-        raise ValueError("--inject-dino-tokens-to-lm requires --use-dino-fusion.")
+    lm_injection_modes = (
+        int(bool(args.inject_det_queries_to_lm))
+        + int(bool(args.inject_dino_tokens_to_lm))
+        + int(bool(args.inject_fused_visual_tokens_to_lm))
+    )
+    if lm_injection_modes > 1:
+        raise ValueError("Choose only one LM fusion path: DET queries, direct DINO tokens, or fused visual tokens.")
+    if (args.inject_dino_tokens_to_lm or args.inject_fused_visual_tokens_to_lm) and not args.use_dino_fusion:
+        raise ValueError("DINO/fused LM token injection requires --use-dino-fusion.")
     os.makedirs(args.output_dir, exist_ok=True)
     torch.manual_seed(args.seed)
     random.seed(args.seed)
@@ -743,7 +715,7 @@ def main() -> None:
             f"DETR query injection enabled: token={DET_QUERY_TOKEN} "
             f"id={det_query_token_id} added={added_det_query_tokens}"
         )
-    if args.inject_dino_tokens_to_lm:
+    if args.inject_dino_tokens_to_lm or args.inject_fused_visual_tokens_to_lm:
         proc_tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else tokenizer
         vocab = proc_tokenizer.get_vocab()
         if DINO_PATCH_TOKEN not in vocab:
@@ -755,7 +727,7 @@ def main() -> None:
         if hasattr(processor, "tokenizer"):
             processor.tokenizer = proc_tokenizer
         print(
-            f"DINO direct LM fusion enabled: token={DINO_PATCH_TOKEN} "
+            f"DINO/fused LM token injection enabled: token={DINO_PATCH_TOKEN} "
             f"id={dino_lm_token_id} added={added_dino_patch_tokens} "
             f"num_tokens={args.dino_lm_num_tokens}"
         )
@@ -771,6 +743,8 @@ def main() -> None:
         dino_lm_token_id=dino_lm_token_id,
         dino_lm_num_tokens=int(args.dino_lm_num_tokens),
         detach_dino_tokens_for_lm=bool(args.detach_dino_tokens_for_lm),
+        inject_fused_visual_tokens_to_lm=bool(args.inject_fused_visual_tokens_to_lm),
+        detach_fused_visual_tokens_for_lm=bool(args.detach_fused_visual_tokens_for_lm),
         use_dino_fusion=bool(args.use_dino_fusion),
         dino_model_name=str(args.dino_model_name),
         dino_trainable=bool(args.dino_trainable),
@@ -929,7 +903,8 @@ def main() -> None:
         lm_append_box_instruction=args.lm_append_box_instruction,
         inject_det_queries_to_lm=args.inject_det_queries_to_lm,
         inject_dino_tokens_to_lm=args.inject_dino_tokens_to_lm,
-        num_queries=(args.dino_lm_num_tokens if args.inject_dino_tokens_to_lm else args.num_queries),
+        inject_fused_visual_tokens_to_lm=args.inject_fused_visual_tokens_to_lm,
+        num_queries=(args.dino_lm_num_tokens if (args.inject_dino_tokens_to_lm or args.inject_fused_visual_tokens_to_lm) else args.num_queries),
         assistant_only_loss=args.assistant_only_loss,
     )
     loader = DataLoader(
@@ -991,18 +966,6 @@ def main() -> None:
                 det_stats = out.get("det_stats", {})
                 pred_count = det_stats.get("pred_count_mean", -1.0)
                 gt_count = det_stats.get("gt_count_mean", -1.0)
-                lm_pred_count_text = None
-                lm_gt_count = None
-                lm_preview_text = None
-                if args.log_lm_generate_every > 0 and (global_step % args.log_lm_generate_every == 0):
-                    lm_preview_text, lm_pred_count_text = _generate_lm_preview_text(
-                        model=model,
-                        processor=processor,
-                        batch_dev=batch,
-                        max_new_tokens=int(args.log_lm_generate_max_new_tokens),
-                    )
-                    if batch_cpu.get("gt_boxes"):
-                        lm_gt_count = int(batch_cpu["gt_boxes"][0].shape[0])
                 print(
                     f"epoch={epoch} step={global_step} "
                     f"total={out['loss'].detach().item():.4f} "
@@ -1010,13 +973,6 @@ def main() -> None:
                     f"det={(det.detach().item() if det is not None else -1):.4f} "
                     f"pred_count={pred_count:.2f} gt_count={gt_count:.2f}"
                 )
-                if args.log_lm_generate_every > 0 and (global_step % args.log_lm_generate_every == 0):
-                    print(
-                        "lm_preview "
-                        f"pred_count={lm_pred_count_text if lm_pred_count_text is not None else 'n/a'} "
-                        f"gt_count={lm_gt_count if lm_gt_count is not None else 'n/a'} "
-                        f"text={json.dumps(lm_preview_text if lm_preview_text is not None else '')}"
-                    )
 
         if args.max_steps > 0 and global_step >= args.max_steps:
             break

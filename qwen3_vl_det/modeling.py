@@ -67,6 +67,8 @@ class AuxDetrBranchConfig:
     dino_lm_token_id: Optional[int] = None
     dino_lm_num_tokens: int = 16
     detach_dino_tokens_for_lm: bool = False
+    inject_fused_visual_tokens_to_lm: bool = False
+    detach_fused_visual_tokens_for_lm: bool = False
     use_dino_fusion: bool = False
     dino_model_name: str = "facebook/dinov2-base"
     dino_drop_cls_token: bool = True
@@ -848,6 +850,31 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
             pooled = self.dino_lm_ln(pooled)
         return pooled
 
+    def _pool_memory_tokens_for_lm(
+        self,
+        memory: torch.Tensor,
+        memory_mask: torch.Tensor,
+        num_tokens: int,
+    ) -> torch.Tensor:
+        pooled_rows: list[torch.Tensor] = []
+        target_tokens = max(int(num_tokens), 1)
+        for b in range(int(memory.shape[0])):
+            valid = memory[b, memory_mask[b]]
+            if valid.numel() == 0:
+                valid = memory[b, :1]
+            if valid.shape[0] != target_tokens:
+                pooled = F.adaptive_avg_pool1d(
+                    valid.transpose(0, 1).unsqueeze(0),
+                    output_size=target_tokens,
+                ).squeeze(0).transpose(0, 1)
+            else:
+                pooled = valid
+            pooled_rows.append(pooled)
+        pooled = torch.stack(pooled_rows, dim=0)
+        if self.dino_lm_ln is not None:
+            pooled = self.dino_lm_ln(pooled)
+        return pooled
+
     def _fuse_qwen_memory_with_dino(
         self,
         memory: torch.Tensor,
@@ -985,6 +1012,74 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
             detach_features=bool(self.branch_cfg.detach_dino_tokens_for_lm),
         )
 
+    def _build_fused_visual_tokens_for_lm(
+        self,
+        hidden_states: torch.Tensor,
+        input_ids: torch.Tensor,
+        pixel_values: Optional[torch.Tensor],
+        image_grid_thw: Optional[torch.Tensor],
+        dino_pixel_values: Optional[torch.Tensor],
+        outputs: Optional[Any],
+    ) -> Optional[torch.Tensor]:
+        if not bool(self.branch_cfg.inject_fused_visual_tokens_to_lm):
+            return None
+        memory, memory_mask = self._extract_visual_memory(
+            hidden_states=hidden_states,
+            input_ids=input_ids,
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+            dino_pixel_values=dino_pixel_values,
+            outputs=outputs,
+        )
+        grid_coords = self._build_grid_coord_tensor(
+            memory=memory,
+            memory_mask=memory_mask,
+            image_grid_thw=image_grid_thw,
+        )
+        if grid_coords is not None:
+            mlp_dtype = next(self.grid_pos_mlp.parameters()).dtype
+            pos = self.grid_pos_mlp(grid_coords.to(dtype=mlp_dtype))
+            if pos.dtype != memory.dtype:
+                pos = pos.to(memory.dtype)
+            memory = memory + pos
+        memory = self._fuse_qwen_memory_with_dino(
+            memory=memory,
+            dino_pixel_values=dino_pixel_values,
+        )
+        return self._pool_memory_tokens_for_lm(
+            memory=memory,
+            memory_mask=memory_mask,
+            num_tokens=int(self.branch_cfg.dino_lm_num_tokens),
+        )
+
+    def _inject_fused_visual_tokens_into_inputs_embeds(
+        self,
+        input_ids: Optional[torch.Tensor],
+        hidden_states: torch.Tensor,
+        pixel_values: Optional[torch.Tensor],
+        image_grid_thw: Optional[torch.Tensor],
+        dino_pixel_values: Optional[torch.Tensor],
+        outputs: Optional[Any],
+    ) -> tuple[Optional[torch.Tensor], int]:
+        if input_ids is None or not torch.is_tensor(input_ids):
+            return None, 0
+        fused_tokens = self._build_fused_visual_tokens_for_lm(
+            hidden_states=hidden_states,
+            input_ids=input_ids,
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+            dino_pixel_values=dino_pixel_values,
+            outputs=outputs,
+        )
+        if fused_tokens is None:
+            return None, 0
+        return self._inject_token_features_into_inputs_embeds(
+            input_ids=input_ids,
+            token_states=fused_tokens,
+            token_id=self.branch_cfg.dino_lm_token_id,
+            detach_features=bool(self.branch_cfg.detach_fused_visual_tokens_for_lm),
+        )
+
     def _run_base_with_inputs_embeds(
         self,
         base_inputs: dict[str, Any],
@@ -1030,8 +1125,16 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
         need_det = det_enabled and (gt_boxes is not None or return_det)
         use_det_lm_fusion = bool(self.branch_cfg.inject_det_queries_to_lm)
         use_dino_lm_fusion = bool(self.branch_cfg.inject_dino_tokens_to_lm) and not use_det_lm_fusion
+        use_fused_visual_lm_fusion = (
+            bool(self.branch_cfg.inject_fused_visual_tokens_to_lm)
+            and not use_det_lm_fusion
+            and not use_dino_lm_fusion
+        )
+        need_visual_memory = bool(need_det or use_fused_visual_lm_fusion)
         if use_det_lm_fusion:
             # LM loss will be computed from a fused second pass after DET query injection.
+            first_inputs.pop("labels", None)
+        if use_fused_visual_lm_fusion:
             first_inputs.pop("labels", None)
         if use_dino_lm_fusion:
             dino_inputs_embeds, dino_injected = self._inject_dino_tokens_into_inputs_embeds(
@@ -1053,11 +1156,11 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
             outputs = self._run_base_with_inputs_embeds(
                 base_inputs={k: v for k, v in first_inputs.items() if k != "dino_pixel_values"},
                 inputs_embeds=dino_inputs_embeds,
-                output_hidden_states=bool(need_det),
+                output_hidden_states=bool(need_visual_memory),
             )
         else:
             outputs = self.base_model(
-                output_hidden_states=bool(need_det),
+                output_hidden_states=bool(need_visual_memory),
                 return_dict=True,
                 **first_inputs,
             )
@@ -1066,8 +1169,8 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
         lm_loss = getattr(outputs, "loss", None)
         if lm_loss is not None:
             result["lm_loss"] = lm_loss
-        hidden = outputs.hidden_states[-1] if need_det else None
-        vision_outputs = outputs if need_det else None
+        hidden = outputs.hidden_states[-1] if need_visual_memory else None
+        vision_outputs = outputs if need_visual_memory else None
         del outputs
 
         det_loss = None
@@ -1118,6 +1221,46 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
                 )
                 result["det_loss"] = det_loss
                 result["det_stats"] = det_stats
+
+        if (
+            use_fused_visual_lm_fusion
+            and hidden is not None
+            and ("labels" in base_inputs)
+            and (base_inputs.get("labels") is not None)
+        ):
+            input_ids = base_inputs.get("input_ids")
+            inputs_embeds, injected = self._inject_fused_visual_tokens_into_inputs_embeds(
+                input_ids=input_ids,
+                hidden_states=hidden,
+                pixel_values=base_inputs.get("pixel_values"),
+                image_grid_thw=base_inputs.get("image_grid_thw"),
+                dino_pixel_values=dino_pixel_values,
+                outputs=vision_outputs,
+            )
+            result["lm_fused_visual_injected"] = bool(injected > 0)
+            result["lm_fused_visual_injected_count"] = int(injected)
+            if inputs_embeds is not None:
+                try:
+                    fused_outputs = self._run_base_with_inputs_embeds(
+                        base_inputs={
+                            k: v
+                            for k, v in base_inputs.items()
+                            if k != "dino_pixel_values"
+                        },
+                        inputs_embeds=inputs_embeds,
+                        output_hidden_states=False,
+                    )
+                    lm_loss = getattr(fused_outputs, "loss", lm_loss)
+                    if lm_loss is not None:
+                        result["lm_loss"] = lm_loss
+                    del fused_outputs
+                except Exception as exc:
+                    if not self._warned_lm_fusion_fail:
+                        print(
+                            "WARNING: fused-visual-to-LM second pass failed; "
+                            f"falling back to base LM path. error={type(exc).__name__}: {exc}"
+                        )
+                        self._warned_lm_fusion_fail = True
 
         if (
             use_det_lm_fusion
@@ -1178,7 +1321,11 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
         **generate_kwargs: Any,
     ) -> torch.Tensor:
         """Generate text using configured visual-token injection into LM prompt embeddings."""
-        if not self.branch_cfg.inject_det_queries_to_lm and not self.branch_cfg.inject_dino_tokens_to_lm:
+        if (
+            not self.branch_cfg.inject_det_queries_to_lm
+            and not self.branch_cfg.inject_dino_tokens_to_lm
+            and not self.branch_cfg.inject_fused_visual_tokens_to_lm
+        ):
             gen_inputs: dict[str, Any] = {"input_ids": input_ids}
             if attention_mask is not None:
                 gen_inputs["attention_mask"] = attention_mask
@@ -1188,7 +1335,11 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
                 gen_inputs["image_grid_thw"] = image_grid_thw
             return self.base_model.generate(**gen_inputs, **generate_kwargs)
 
-        if self.branch_cfg.inject_dino_tokens_to_lm and not self.branch_cfg.inject_det_queries_to_lm:
+        if (
+            self.branch_cfg.inject_dino_tokens_to_lm
+            and not self.branch_cfg.inject_det_queries_to_lm
+            and not self.branch_cfg.inject_fused_visual_tokens_to_lm
+        ):
             inputs_embeds, injected = self._inject_dino_tokens_into_inputs_embeds(
                 input_ids=input_ids,
                 dino_pixel_values=dino_pixel_values,
@@ -1207,6 +1358,48 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
                     if not self._warned_lm_fusion_fail:
                         print(
                             "WARNING: DINO direct-fusion generate with pixel inputs failed; "
+                            f"retrying without pixel tensors. error={type(exc).__name__}: {exc}"
+                        )
+                        self._warned_lm_fusion_fail = True
+                    gen_inputs.pop("pixel_values", None)
+                    gen_inputs.pop("image_grid_thw", None)
+                    return self.base_model.generate(**gen_inputs, **generate_kwargs)
+
+        if (
+            self.branch_cfg.inject_fused_visual_tokens_to_lm
+            and not self.branch_cfg.inject_det_queries_to_lm
+        ):
+            outputs = self.base_model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                pixel_values=pixel_values,
+                image_grid_thw=image_grid_thw,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+            hidden = outputs.hidden_states[-1]
+            inputs_embeds, injected = self._inject_fused_visual_tokens_into_inputs_embeds(
+                input_ids=input_ids,
+                hidden_states=hidden,
+                pixel_values=pixel_values,
+                image_grid_thw=image_grid_thw,
+                dino_pixel_values=dino_pixel_values,
+                outputs=outputs,
+            )
+            if inputs_embeds is not None and injected > 0:
+                gen_inputs: dict[str, Any] = {"inputs_embeds": inputs_embeds}
+                if attention_mask is not None:
+                    gen_inputs["attention_mask"] = attention_mask
+                if pixel_values is not None:
+                    gen_inputs["pixel_values"] = pixel_values
+                if image_grid_thw is not None:
+                    gen_inputs["image_grid_thw"] = image_grid_thw
+                try:
+                    return self.base_model.generate(**gen_inputs, **generate_kwargs)
+                except Exception as exc:
+                    if not self._warned_lm_fusion_fail:
+                        print(
+                            "WARNING: fused-visual generate with pixel inputs failed; "
                             f"retrying without pixel tensors. error={type(exc).__name__}: {exc}"
                         )
                         self._warned_lm_fusion_fail = True

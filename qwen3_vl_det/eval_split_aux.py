@@ -320,6 +320,12 @@ def build_model_and_processor(args: argparse.Namespace):
             f"(dino_lm_token_id={getattr(branch_cfg, 'dino_lm_token_id', None)}, "
             f"num_tokens={getattr(branch_cfg, 'dino_lm_num_tokens', None)})"
         )
+    if bool(getattr(branch_cfg, "inject_fused_visual_tokens_to_lm", False)):
+        print(
+            "LM fusion mode: fused visual "
+            f"(dino_lm_token_id={getattr(branch_cfg, 'dino_lm_token_id', None)}, "
+            f"num_tokens={getattr(branch_cfg, 'dino_lm_num_tokens', None)})"
+        )
     dino_processor = None
     if bool(getattr(branch_cfg, "use_dino_fusion", False)):
         dino_model_name = str(getattr(branch_cfg, "dino_model_name", "")).strip()
@@ -399,7 +405,10 @@ def main() -> None:
         ):
             query_text = " ".join([DET_QUERY_TOKEN] * max(int(args.num_queries), 1))
             user_text = f"{user_text}\n{query_text}"
-        if bool(getattr(model.branch_cfg, "inject_dino_tokens_to_lm", False)) and (
+        if (
+            bool(getattr(model.branch_cfg, "inject_dino_tokens_to_lm", False))
+            or bool(getattr(model.branch_cfg, "inject_fused_visual_tokens_to_lm", False))
+        ) and (
             getattr(model.branch_cfg, "dino_lm_token_id", None) is not None
         ):
             dino_text = " ".join(

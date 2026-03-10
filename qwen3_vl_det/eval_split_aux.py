@@ -201,6 +201,19 @@ def extract_count_from_text(text: str) -> int | None:
     return None
 
 
+def _box_format_instruction(lm_box_output_mode: str, lm_box_output_order: str) -> str:
+    coord_desc = {
+        "absolute": "absolute pixel coordinates",
+        "norm1000": "0-1000 normalized coordinates",
+        "norm01": "0-1 normalized coordinates",
+    }.get(lm_box_output_mode, lm_box_output_mode)
+    order_desc = " [y1, x1, y2, x2]" if lm_box_output_order == "yxyx" else " [x1, y1, x2, y2]"
+    return (
+        "Please output one target box per line in the format "
+        f"<box>{order_desc}</box> using {coord_desc}, and include 'Total count: N'."
+    )
+
+
 def cxcywh_to_xyxy_abs(boxes: torch.Tensor, width: int, height: int) -> torch.Tensor:
     if boxes.numel() == 0:
         return torch.zeros((0, 4), dtype=torch.float32)
@@ -364,6 +377,8 @@ def main() -> None:
     ckpt_source = str(train_args.get("box_supervision_source", "")).lower()
     ckpt_lm_mode = str(train_args.get("lm_box_output_mode", "")).lower()
     ckpt_lm_order = str(train_args.get("lm_box_output_order", "")).lower()
+    ckpt_lm_target_mode = str(train_args.get("lm_target_mode", "")).lower()
+    ckpt_lm_append_box_instruction = bool(train_args.get("lm_append_box_instruction", False))
     effective_mode = args.box_coord_mode
     effective_order = args.box_coord_order
     effective_source = args.box_supervision_source
@@ -415,6 +430,11 @@ def main() -> None:
                 [DINO_PATCH_TOKEN] * max(int(getattr(model.branch_cfg, "dino_lm_num_tokens", 16)), 1)
             )
             user_text = f"{user_text}\n{dino_text}"
+        if ckpt_lm_target_mode == "box_count" and ckpt_lm_append_box_instruction:
+            user_text = (
+                f"{user_text}\n"
+                f"{_box_format_instruction(ckpt_lm_mode or 'norm1000', ckpt_lm_order or 'yxyx')}"
+            )
         chat_messages = [
             {
                 "role": "user",

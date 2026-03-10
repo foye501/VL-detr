@@ -177,6 +177,19 @@ def extract_count_from_text(text: str) -> int | None:
     return None
 
 
+def _box_format_instruction(lm_box_output_mode: str, lm_box_output_order: str) -> str:
+    coord_desc = {
+        "absolute": "absolute pixel coordinates",
+        "norm1000": "0-1000 normalized coordinates",
+        "norm01": "0-1 normalized coordinates",
+    }.get(lm_box_output_mode, lm_box_output_mode)
+    order_desc = " [y1, x1, y2, x2]" if lm_box_output_order == "yxyx" else " [x1, y1, x2, y2]"
+    return (
+        "Please output one target box per line in the format "
+        f"<box>{order_desc}</box> using {coord_desc}, and include 'Total count: N'."
+    )
+
+
 def _derive_path(base_path: str, suffix: str) -> str:
     root, ext = os.path.splitext(base_path)
     if not ext:
@@ -247,6 +260,8 @@ def main() -> None:
             train_args = json.load(f)
     ckpt_lm_mode = str(train_args.get("lm_box_output_mode", "")).lower()
     ckpt_lm_order = str(train_args.get("lm_box_output_order", "")).lower()
+    ckpt_lm_target_mode = str(train_args.get("lm_target_mode", "")).lower()
+    ckpt_lm_append_box_instruction = bool(train_args.get("lm_append_box_instruction", False))
     effective_lm_parse_mode = args.lm_box_parse_mode
     effective_lm_parse_order = args.lm_box_parse_order
     if effective_lm_parse_mode == "auto" and ckpt_lm_mode in ("absolute", "norm1000", "norm01"):
@@ -352,6 +367,8 @@ def main() -> None:
     ):
         dino_text = " ".join([DINO_PATCH_TOKEN] * max(int(getattr(branch_cfg, "dino_lm_num_tokens", 16)), 1))
         user_text = f"{user_text}\n{dino_text}"
+    if ckpt_lm_target_mode == "box_count" and ckpt_lm_append_box_instruction:
+        user_text = f"{user_text}\n{_box_format_instruction(ckpt_lm_mode or 'norm1000', ckpt_lm_order or 'yxyx')}"
     chat_messages = [
         {
             "role": "user",

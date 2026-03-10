@@ -107,6 +107,9 @@ class TrainAuxArgs:
     dino_cross_attn_dropout: float = 0.0
     dino_gate_init: float = 0.1
     gradient_checkpointing: bool = True
+    debug_first_batch: bool = False
+    debug_first_batch_generate: bool = True
+    debug_first_batch_max_new_tokens: int = 128
     seed: int = 7
     hf_token: str = ""
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -214,6 +217,10 @@ def parse_args() -> TrainAuxArgs:
     p.add_argument("--dino-gate-init", type=float, default=TrainAuxArgs.dino_gate_init)
     p.add_argument("--gradient-checkpointing", dest="gradient_checkpointing", action="store_true")
     p.add_argument("--no-gradient-checkpointing", dest="gradient_checkpointing", action="store_false")
+    p.add_argument("--debug-first-batch", action="store_true")
+    p.add_argument("--debug-first-batch-generate", dest="debug_first_batch_generate", action="store_true")
+    p.add_argument("--no-debug-first-batch-generate", dest="debug_first_batch_generate", action="store_false")
+    p.add_argument("--debug-first-batch-max-new-tokens", type=int, default=TrainAuxArgs.debug_first_batch_max_new_tokens)
     p.add_argument("--seed", type=int, default=TrainAuxArgs.seed)
     p.add_argument("--hf-token", default=TrainAuxArgs.hf_token)
     p.add_argument("--device", default=TrainAuxArgs.device)
@@ -225,6 +232,7 @@ def parse_args() -> TrainAuxArgs:
         lm_append_box_instruction=TrainAuxArgs.lm_append_box_instruction,
         dino_drop_cls_token=TrainAuxArgs.dino_drop_cls_token,
         gradient_checkpointing=TrainAuxArgs.gradient_checkpointing,
+        debug_first_batch_generate=TrainAuxArgs.debug_first_batch_generate,
     )
     ns = p.parse_args()
     return TrainAuxArgs(**vars(ns))
@@ -356,6 +364,8 @@ class ShareGptAuxCollator:
     def __call__(self, batch: list[dict[str, Any]]) -> dict[str, Any]:
         texts = []
         prompt_texts = []
+        user_texts = []
+        assistant_targets = []
         images = []
         gt_boxes: list[torch.Tensor] = []
 
@@ -389,6 +399,8 @@ class ShareGptAuxCollator:
                 user_text = f"{user_text}\n{dino_text}"
             if self.lm_append_box_instruction and lm_mode_used == "box_count":
                 user_text = f"{user_text}\n{self._box_format_instruction()}"
+            user_texts.append(user_text)
+            assistant_targets.append(assistant_text)
             user_msg = {
                 "role": "user",
                 "content": [
@@ -491,7 +503,150 @@ class ShareGptAuxCollator:
             out["dino_pixel_values"] = dino_inputs["pixel_values"]
         out["labels"] = labels
         out["gt_boxes"] = gt_boxes
+        out["debug_texts"] = texts
+        out["debug_prompt_texts"] = prompt_texts
+        out["debug_user_texts"] = user_texts
+        out["debug_assistant_targets"] = assistant_targets
         return out
+
+
+def _decode_non_ignored_labels(tokenizer, labels_1d: torch.Tensor) -> str:
+    kept = labels_1d[labels_1d != -100]
+    if kept.numel() == 0:
+        return ""
+    return tokenizer.decode(kept.tolist(), skip_special_tokens=False, clean_up_tokenization_spaces=False)
+
+
+def _first_token_positions(ids_1d: torch.Tensor, token_id: int) -> list[int]:
+    if token_id < 0:
+        return []
+    return [int(x) for x in torch.where(ids_1d == int(token_id))[0].detach().cpu().tolist()]
+
+
+def _summarize_boxes(gt_boxes: list[torch.Tensor]) -> list[list[list[float]]]:
+    out: list[list[list[float]]] = []
+    for boxes in gt_boxes:
+        sample_boxes: list[list[float]] = []
+        if boxes.numel() > 0:
+            for row in boxes[: min(int(boxes.shape[0]), 10)].detach().cpu().tolist():
+                sample_boxes.append([round(float(v), 4) for v in row])
+        out.append(sample_boxes)
+    return out
+
+
+def _dump_first_batch_debug(
+    args: TrainAuxArgs,
+    model: Qwen3VLAuxDetrAdapter,
+    processor,
+    batch_cpu: dict[str, Any],
+    batch_dev: dict[str, Any],
+    out: dict[str, Any],
+) -> str:
+    tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+    input_ids = batch_cpu["input_ids"]
+    labels = batch_cpu["labels"]
+    attention_mask = batch_cpu.get("attention_mask")
+    sample_input_ids = input_ids[0]
+    sample_labels = labels[0]
+    sample_attention = attention_mask[0] if torch.is_tensor(attention_mask) else None
+
+    pred_text = None
+    if args.debug_first_batch_generate:
+        gen_kwargs: dict[str, Any] = {
+            "input_ids": batch_dev["input_ids"][:1],
+            "max_new_tokens": int(args.debug_first_batch_max_new_tokens),
+            "do_sample": False,
+        }
+        for k in ("attention_mask", "pixel_values", "image_grid_thw", "dino_pixel_values"):
+            if k in batch_dev and torch.is_tensor(batch_dev[k]):
+                gen_kwargs[k] = batch_dev[k][:1]
+        was_training = model.training
+        model.eval()
+        try:
+            with torch.no_grad():
+                gen_ids = model.generate_with_visual_injection(**gen_kwargs)
+            prompt_len = int(gen_kwargs["input_ids"].shape[1])
+            trimmed = gen_ids[0, prompt_len:] if gen_ids.shape[1] > prompt_len else gen_ids[0]
+            pred_text = tokenizer.decode(
+                trimmed.detach().cpu().tolist(),
+                skip_special_tokens=False,
+                clean_up_tokenization_spaces=False,
+            )
+        finally:
+            if was_training:
+                model.train()
+
+    det_summary: dict[str, Any] = {}
+    if "det_obj_logits" in out and torch.is_tensor(out["det_obj_logits"]):
+        obj_prob = out["det_obj_logits"][0].detach().float().sigmoid().cpu()
+        topk = min(10, int(obj_prob.shape[0]))
+        top_scores, top_idx = torch.topk(obj_prob, k=topk, largest=True)
+        det_summary["top_objectness"] = [
+            {"query_idx": int(i.item()), "score": round(float(s.item()), 4)}
+            for s, i in zip(top_scores, top_idx)
+        ]
+    if "det_boxes" in out and torch.is_tensor(out["det_boxes"]):
+        det_summary["top_boxes_norm_cxcywh"] = [
+            [round(float(v), 4) for v in row]
+            for row in out["det_boxes"][0][: min(10, int(out["det_boxes"][0].shape[0]))].detach().cpu().tolist()
+        ]
+
+    debug_payload = {
+        "train_args_subset": {
+            "lm_target_mode": args.lm_target_mode,
+            "lm_weight": args.lm_weight,
+            "det_weight": args.det_weight,
+            "inject_det_queries_to_lm": bool(args.inject_det_queries_to_lm),
+            "inject_dino_tokens_to_lm": bool(args.inject_dino_tokens_to_lm),
+            "dino_lm_num_tokens": int(args.dino_lm_num_tokens),
+            "use_dino_fusion": bool(args.use_dino_fusion),
+            "strict_vision_memory": bool(args.strict_vision_memory),
+        },
+        "batch_shapes": {
+            k: list(v.shape) for k, v in batch_cpu.items() if torch.is_tensor(v)
+        },
+        "special_token_positions": {
+            "det_query_token_id": int(model.branch_cfg.det_query_token_id) if model.branch_cfg.det_query_token_id is not None else None,
+            "det_query_positions_sample0": _first_token_positions(sample_input_ids, int(model.branch_cfg.det_query_token_id) if model.branch_cfg.det_query_token_id is not None else -1),
+            "dino_lm_token_id": int(model.branch_cfg.dino_lm_token_id) if model.branch_cfg.dino_lm_token_id is not None else None,
+            "dino_lm_positions_sample0": _first_token_positions(sample_input_ids, int(model.branch_cfg.dino_lm_token_id) if model.branch_cfg.dino_lm_token_id is not None else -1),
+        },
+        "sample0": {
+            "user_text": batch_cpu.get("debug_user_texts", [""])[0],
+            "assistant_target_text": batch_cpu.get("debug_assistant_targets", [""])[0],
+            "chat_text": batch_cpu.get("debug_texts", [""])[0],
+            "prompt_text": batch_cpu.get("debug_prompt_texts", [""])[0],
+            "decoded_input_with_specials": tokenizer.decode(
+                sample_input_ids.detach().cpu().tolist(),
+                skip_special_tokens=False,
+                clean_up_tokenization_spaces=False,
+            ),
+            "decoded_supervised_labels_only": _decode_non_ignored_labels(tokenizer, sample_labels.detach().cpu()),
+            "input_token_ids_first_256": [int(x) for x in sample_input_ids[:256].detach().cpu().tolist()],
+            "label_token_ids_first_256": [int(x) for x in sample_labels[:256].detach().cpu().tolist()],
+            "attention_mask_first_256": (
+                [int(x) for x in sample_attention[:256].detach().cpu().tolist()]
+                if sample_attention is not None else None
+            ),
+            "generated_text": pred_text,
+        },
+        "gt_boxes_first_batch_norm_cxcywh": _summarize_boxes(batch_cpu.get("gt_boxes", [])),
+        "model_output": {
+            "loss": round(float(out["loss"].detach().cpu().item()), 6) if "loss" in out and torch.is_tensor(out["loss"]) else None,
+            "lm_loss": round(float(out["lm_loss"].detach().cpu().item()), 6) if "lm_loss" in out and torch.is_tensor(out["lm_loss"]) else None,
+            "det_loss": round(float(out["det_loss"].detach().cpu().item()), 6) if "det_loss" in out and torch.is_tensor(out["det_loss"]) else None,
+            "det_stats": out.get("det_stats"),
+            "det_summary": det_summary,
+            "lm_dino_token_injected": out.get("lm_dino_token_injected"),
+            "lm_dino_token_injected_count": out.get("lm_dino_token_injected_count"),
+            "lm_det_query_injected": out.get("lm_det_query_injected"),
+            "lm_det_query_injected_count": out.get("lm_det_query_injected_count"),
+        },
+    }
+    debug_path = os.path.join(args.output_dir, "debug_first_batch.json")
+    with open(debug_path, "w", encoding="utf-8") as f:
+        json.dump(debug_payload, f, indent=2)
+    return debug_path
 
 
 def main() -> None:
@@ -746,6 +901,7 @@ def main() -> None:
     optimizer = torch.optim.AdamW(trainable_params, lr=args.lr)
 
     global_step = 0
+    debug_dump_done = False
     optimizer.zero_grad(set_to_none=True)
     for epoch in range(args.epochs):
         for _, batch in enumerate(loader):
@@ -753,6 +909,7 @@ def main() -> None:
             if args.max_steps > 0 and global_step > args.max_steps:
                 break
 
+            batch_cpu = batch
             batch = to_device(batch, args.device)
             model_inputs = {
                 "input_ids": batch["input_ids"],
@@ -766,6 +923,17 @@ def main() -> None:
                     model_inputs[k] = batch[k]
 
             out = model(**model_inputs)
+            if args.debug_first_batch and not debug_dump_done:
+                debug_path = _dump_first_batch_debug(
+                    args=args,
+                    model=model,
+                    processor=processor,
+                    batch_cpu=batch_cpu,
+                    batch_dev=batch,
+                    out=out,
+                )
+                print(f"Saved first-batch debug: {debug_path}")
+                debug_dump_done = True
             loss = out["loss"] / max(args.grad_accum_steps, 1)
             loss.backward()
 

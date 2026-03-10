@@ -112,6 +112,8 @@ class TrainAuxArgs:
     debug_first_batch: bool = False
     debug_first_batch_generate: bool = True
     debug_first_batch_max_new_tokens: int = 128
+    log_lm_generate_every: int = 0
+    log_lm_generate_max_new_tokens: int = 128
     seed: int = 7
     hf_token: str = ""
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -225,6 +227,8 @@ def parse_args() -> TrainAuxArgs:
     p.add_argument("--debug-first-batch-generate", dest="debug_first_batch_generate", action="store_true")
     p.add_argument("--no-debug-first-batch-generate", dest="debug_first_batch_generate", action="store_false")
     p.add_argument("--debug-first-batch-max-new-tokens", type=int, default=TrainAuxArgs.debug_first_batch_max_new_tokens)
+    p.add_argument("--log-lm-generate-every", type=int, default=TrainAuxArgs.log_lm_generate_every)
+    p.add_argument("--log-lm-generate-max-new-tokens", type=int, default=TrainAuxArgs.log_lm_generate_max_new_tokens)
     p.add_argument("--seed", type=int, default=TrainAuxArgs.seed)
     p.add_argument("--hf-token", default=TrainAuxArgs.hf_token)
     p.add_argument("--device", default=TrainAuxArgs.device)
@@ -523,6 +527,29 @@ def _decode_non_ignored_labels(tokenizer, labels_1d: torch.Tensor) -> str:
     return tokenizer.decode(kept.tolist(), skip_special_tokens=False, clean_up_tokenization_spaces=False)
 
 
+def _extract_count_from_text(text: str) -> int | None:
+    import re
+
+    patterns = [
+        r"total\s*count\s*[:=]\s*(-?\d+)",
+        r"count\s*[:=]\s*(-?\d+)",
+    ]
+    for pat in patterns:
+        m = re.search(pat, text, flags=re.IGNORECASE)
+        if m:
+            try:
+                return int(m.group(1))
+            except Exception:
+                pass
+    nums = re.findall(r"(?<![\d.])-?\d+(?![\d.])", text)
+    if len(nums) == 1:
+        try:
+            return int(nums[0])
+        except Exception:
+            return None
+    return None
+
+
 def _first_token_positions(ids_1d: torch.Tensor, token_id: int) -> list[int]:
     if token_id < 0:
         return []
@@ -656,6 +683,76 @@ def _dump_first_batch_debug(
     with open(debug_path, "w", encoding="utf-8") as f:
         json.dump(debug_payload, f, indent=2)
     return debug_path
+
+
+def _log_lm_preview(
+    *,
+    args: TrainAuxArgs,
+    model: Qwen3VLAuxDetrAdapter,
+    processor,
+    batch_cpu: dict[str, Any],
+    batch_dev: dict[str, Any],
+) -> None:
+    prompt_texts = batch_cpu.get("debug_prompt_texts")
+    gt_boxes = batch_cpu.get("gt_boxes")
+    if not prompt_texts or not isinstance(prompt_texts, list):
+        return
+    prompt_text = prompt_texts[0]
+    if not prompt_text:
+        return
+
+    # Tokenize the prompt-only text. Reuse already-prepared image tensors from the batch.
+    prompt_inputs = processor(
+        text=[prompt_text],
+        padding=True,
+        return_tensors="pt",
+    )
+    prompt_inputs = {
+        k: (v.to(args.device) if torch.is_tensor(v) else v)
+        for k, v in prompt_inputs.items()
+    }
+    for k in ("pixel_values", "image_grid_thw", "dino_pixel_values"):
+        if k in batch_dev and torch.is_tensor(batch_dev[k]):
+            prompt_inputs[k] = batch_dev[k][:1]
+
+    gen_kwargs: dict[str, Any] = {
+        "input_ids": prompt_inputs["input_ids"],
+        "max_new_tokens": int(args.log_lm_generate_max_new_tokens),
+        "do_sample": False,
+    }
+    if "attention_mask" in prompt_inputs and torch.is_tensor(prompt_inputs["attention_mask"]):
+        gen_kwargs["attention_mask"] = prompt_inputs["attention_mask"]
+    for k in ("pixel_values", "image_grid_thw", "dino_pixel_values"):
+        if k in prompt_inputs and torch.is_tensor(prompt_inputs[k]):
+            gen_kwargs[k] = prompt_inputs[k]
+
+    was_training = model.training
+    model.eval()
+    try:
+        with torch.no_grad():
+            gen_ids = model.generate_with_visual_injection(**gen_kwargs)
+        prompt_len = int(gen_kwargs["input_ids"].shape[1])
+        trimmed = gen_ids[0, prompt_len:] if gen_ids.shape[1] > prompt_len else gen_ids[0]
+        pred_text = processor.tokenizer.decode(
+            trimmed.detach().cpu().tolist(),
+            skip_special_tokens=False,
+            clean_up_tokenization_spaces=False,
+        )
+        pred_count = _extract_count_from_text(pred_text)
+        gt_count = None
+        if isinstance(gt_boxes, list) and gt_boxes:
+            boxes0 = gt_boxes[0]
+            if torch.is_tensor(boxes0):
+                gt_count = int(boxes0.shape[0])
+        compact_text = " ".join(pred_text.strip().split())
+        print(
+            f'lm_preview pred_count={pred_count if pred_count is not None else "n/a"} '
+            f'gt_count={gt_count if gt_count is not None else "n/a"} '
+            f'text="{compact_text[:240]}"'
+        )
+    finally:
+        if was_training:
+            model.train()
 
 
 def main() -> None:
@@ -972,6 +1069,14 @@ def main() -> None:
                     f"lm={(lm.detach().item() if lm is not None else -1):.4f} "
                     f"det={(det.detach().item() if det is not None else -1):.4f} "
                     f"pred_count={pred_count:.2f} gt_count={gt_count:.2f}"
+                )
+            if args.log_lm_generate_every > 0 and global_step % args.log_lm_generate_every == 0:
+                _log_lm_preview(
+                    args=args,
+                    model=model,
+                    processor=processor,
+                    batch_cpu=batch_cpu,
+                    batch_dev=batch,
                 )
 
         if args.max_steps > 0 and global_step >= args.max_steps:

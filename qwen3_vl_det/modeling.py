@@ -847,7 +847,9 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
         else:
             pooled = dino_tokens
         if self.dino_lm_ln is not None:
-            pooled = self.dino_lm_ln(pooled)
+            ln_dtype = self.dino_lm_ln.weight.dtype
+            pooled_in = pooled if pooled.dtype == ln_dtype else pooled.to(ln_dtype)
+            pooled = self.dino_lm_ln(pooled_in)
         return pooled
 
     def _pool_memory_tokens_for_lm(
@@ -872,7 +874,9 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
             pooled_rows.append(pooled)
         pooled = torch.stack(pooled_rows, dim=0)
         if self.dino_lm_ln is not None:
-            pooled = self.dino_lm_ln(pooled)
+            ln_dtype = self.dino_lm_ln.weight.dtype
+            pooled_in = pooled if pooled.dtype == ln_dtype else pooled.to(ln_dtype)
+            pooled = self.dino_lm_ln(pooled_in)
         return pooled
 
     def _fuse_qwen_memory_with_dino(

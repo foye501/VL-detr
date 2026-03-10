@@ -250,6 +250,50 @@ def _checkpoint_uses_detr(train_args: dict[str, Any], branch_cfg: AuxDetrBranchC
     return det_weight > 0.0 or bool(getattr(branch_cfg, "inject_det_queries_to_lm", False))
 
 
+def _raw_gt_box_source(
+    example: dict[str, Any],
+    box_supervision_source: str,
+) -> tuple[str | None, list[list[float]]]:
+    source = str(box_supervision_source).strip().lower()
+    target_fields = [
+        "target_boxes_yxyx_1000",
+        "target_boxes_xyxy_1000",
+        "target_boxes_xyxy_abs",
+        "target_boxes_cxcywh_norm",
+        "target_boxes",
+        "boxes_yxyx_1000",
+        "boxes_xyxy_1000",
+        "boxes_xyxy_abs",
+        "boxes_cxcywh_norm",
+        "gt_boxes",
+    ]
+    all_fields = [
+        "all_boxes_yxyx_1000",
+        "all_boxes_xyxy_1000",
+        "all_boxes_xyxy_abs",
+        "all_boxes_cxcywh_norm",
+        "all_boxes",
+    ]
+    distractor_fields = [
+        "distractor_boxes_yxyx_1000",
+        "distractor_boxes_xyxy_1000",
+        "distractor_boxes_xyxy_abs",
+        "distractor_boxes_cxcywh_norm",
+        "distractor_boxes",
+    ]
+    field_groups = [all_fields] if source == "all" else [target_fields]
+    if source == "all":
+        field_groups.append(target_fields)
+        field_groups.append(distractor_fields)
+    for fields in field_groups:
+        for name in fields:
+            if name in example and example[name] is not None:
+                value = example[name]
+                if isinstance(value, list):
+                    return name, value
+    return None, []
+
+
 def main() -> None:
     args = parse_args()
     os.makedirs(os.path.dirname(args.output_image) or ".", exist_ok=True)
@@ -449,6 +493,7 @@ def main() -> None:
     lm_count_text: int | None = None
     lm_boxes = torch.zeros((0, 4), dtype=torch.float32)
     lm_xyxy = torch.zeros((0, 4), dtype=torch.float32)
+    lm_raw_boxes = []
     if args.eval_lm_generation:
         gen_kwargs = {
             "input_ids": inputs["input_ids"],
@@ -477,6 +522,7 @@ def main() -> None:
             clean_up_tokenization_spaces=False,
         )[0]
         lm_count_text = extract_count_from_text(lm_generated_text)
+        lm_raw_boxes = extract_boxes_raw(lm_generated_text)
         lm_boxes = parse_boxes_from_text(
             lm_generated_text,
             width=w,
@@ -536,6 +582,7 @@ def main() -> None:
         box_supervision_source=effective_source,
     )
     gt_xyxy = cxcywh_to_xyxy_abs(gt_boxes, width=w, height=h)
+    gt_raw_field, gt_raw_boxes = _raw_gt_box_source(ex, effective_source)
     gt_labels = _indexed_labels("g", int(gt_xyxy.shape[0]))
     lm_labels = _indexed_labels("p", int(lm_xyxy.shape[0]))
 
@@ -640,11 +687,20 @@ def main() -> None:
             "pred_count_lm_boxes": int(lm_boxes.shape[0]),
         },
         "gt_boxes": gt_items,
+        "gt_boxes_raw_source": {
+            "field": gt_raw_field,
+            "values": gt_raw_boxes,
+        },
         "pred_boxes_thresholded_detr": pred_items,
         "pred_topk_queries_detr": top_items,
         "pred_boxes_lm_generation": [
             {
                 "rank": i,
+                "raw_box_text_order": (
+                    [float(v) for v in lm_raw_boxes[i]]
+                    if i < len(lm_raw_boxes)
+                    else None
+                ),
                 "cxcywh_norm": [_round4(v) for v in lm_boxes[i].tolist()],
                 "xyxy_abs": [_round4(v) for v in lm_xyxy[i].tolist()],
             }
@@ -710,6 +766,15 @@ def main() -> None:
                 "h_mean": round(float(gt_boxes[:, 3].mean()), 4),
             },
         )
+    if gt_raw_field:
+        print(f"GT raw boxes source: {gt_raw_field}")
+        for i, raw in enumerate(gt_raw_boxes[:20]):
+            xyxy = (
+                [_round4(v) for v in gt_xyxy[i].tolist()]
+                if i < int(gt_xyxy.shape[0])
+                else None
+            )
+            print(f"  g{i+1}: raw={raw} -> xyxy_abs={xyxy}")
     if det_active and pred_boxes.numel() > 0:
         print(
             "Pred box stats (norm cxcywh):",
@@ -733,6 +798,15 @@ def main() -> None:
     if "lm_loss" in out:
         print(f"LM loss (for this sample prompt): {float(out['lm_loss'].detach().cpu()):.4f}")
     if args.eval_lm_generation:
+        if lm_raw_boxes:
+            print("LM raw boxes (text order):")
+            for i, raw in enumerate(lm_raw_boxes[:20]):
+                xyxy = (
+                    [_round4(v) for v in lm_xyxy[i].tolist()]
+                    if i < int(lm_xyxy.shape[0])
+                    else None
+                )
+                print(f"  p{i+1}: raw={raw} -> xyxy_abs={xyxy}")
         print("LM generated text:")
         print(lm_generated_text)
     if args.base_model_only:

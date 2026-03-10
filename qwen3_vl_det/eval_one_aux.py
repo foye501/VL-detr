@@ -152,6 +152,10 @@ def draw_labeled_boxes(
         draw.text((tx, ty), lab, fill=color)
 
 
+def _indexed_labels(prefix: str, count: int) -> list[str]:
+    return [f"{prefix}{i+1}" for i in range(count)]
+
+
 def _round4(v: float) -> float:
     return round(float(v), 4)
 
@@ -201,6 +205,8 @@ def build_comparison_strip(
     gt_img: Image.Image,
     pred_img: Image.Image,
     overlay_img: Image.Image,
+    *,
+    pred_title: str = "Pred",
 ) -> Image.Image:
     w, h = gt_img.size
     out = Image.new("RGB", (w * 3, h + 22), color=(255, 255, 255))
@@ -209,7 +215,7 @@ def build_comparison_strip(
     out.paste(overlay_img, (2 * w, 22))
     draw = ImageDraw.Draw(out)
     draw.text((8, 4), "GT", fill="black")
-    draw.text((w + 8, 4), "Pred", fill="black")
+    draw.text((w + 8, 4), pred_title, fill="black")
     draw.text((2 * w + 8, 4), "Overlay", fill="black")
     return out
 
@@ -219,6 +225,8 @@ def build_four_panel_strip(
     det_img: Image.Image,
     lm_img: Image.Image,
     overlay_img: Image.Image,
+    *,
+    det_title: str = "DETR",
 ) -> Image.Image:
     w, h = gt_img.size
     out = Image.new("RGB", (w * 4, h + 22), color=(255, 255, 255))
@@ -228,10 +236,18 @@ def build_four_panel_strip(
     out.paste(overlay_img, (3 * w, 22))
     draw = ImageDraw.Draw(out)
     draw.text((8, 4), "GT", fill="black")
-    draw.text((w + 8, 4), "DETR", fill="black")
+    draw.text((w + 8, 4), det_title, fill="black")
     draw.text((2 * w + 8, 4), "LM boxes", fill="black")
     draw.text((3 * w + 8, 4), "All", fill="black")
     return out
+
+
+def _checkpoint_uses_detr(train_args: dict[str, Any], branch_cfg: AuxDetrBranchConfig) -> bool:
+    try:
+        det_weight = float(train_args.get("det_weight", 0.0))
+    except Exception:
+        det_weight = 0.0
+    return det_weight > 0.0 or bool(getattr(branch_cfg, "inject_det_queries_to_lm", False))
 
 
 def main() -> None:
@@ -301,6 +317,7 @@ def main() -> None:
     if (not args.base_model_only) and ckpt_num_queries != int(args.num_queries):
         print(f"INFO: overriding --num-queries {args.num_queries} with checkpoint value {ckpt_num_queries}")
     args.num_queries = ckpt_num_queries
+    det_active = (not args.base_model_only) and _checkpoint_uses_detr(train_args, branch_cfg)
 
     load_dtype = torch.bfloat16 if args.device.startswith("cuda") else torch.float32
     base_model_load_source = args.model_name or ckpt_dir
@@ -411,7 +428,7 @@ def main() -> None:
         print(f"DINO pixel_values shape: {tuple(inputs['dino_pixel_values'].shape)}")
 
     out: dict[str, Any] = {}
-    if args.base_model_only:
+    if args.base_model_only or not det_active:
         obj_prob = torch.zeros((0,), dtype=torch.float32)
         box_pred = torch.zeros((0, 4), dtype=torch.float32)
     else:
@@ -519,28 +536,32 @@ def main() -> None:
         box_supervision_source=effective_source,
     )
     gt_xyxy = cxcywh_to_xyxy_abs(gt_boxes, width=w, height=h)
+    gt_labels = _indexed_labels("g", int(gt_xyxy.shape[0]))
+    lm_labels = _indexed_labels("p", int(lm_xyxy.shape[0]))
 
     vis_gt = img.copy()
-    draw_boxes(vis_gt, gt_xyxy, color="lime", width=3)  # GT
+    draw_labeled_boxes(vis_gt, gt_xyxy, labels=gt_labels, color="lime", width=3)
 
     vis_pred = img.copy()
-    if args.annotate_scores and pred_xyxy.numel() > 0:
+    if det_active and args.annotate_scores and pred_xyxy.numel() > 0:
         labels = [f"{_round4(s)}" for s in pred_scores.tolist()]
         draw_labeled_boxes(vis_pred, pred_xyxy, labels=labels, color="red", width=2)
-    else:
+    elif det_active:
         draw_boxes(vis_pred, pred_xyxy, color="red", width=2)  # Pred
+    else:
+        ImageDraw.Draw(vis_pred).text((8, 8), "DETR disabled", fill="red")
 
     vis_lm = img.copy()
-    draw_boxes(vis_lm, lm_xyxy, color="dodgerblue", width=2)  # LM parsed boxes
+    draw_labeled_boxes(vis_lm, lm_xyxy, labels=lm_labels, color="dodgerblue", width=2)
 
     vis_overlay = img.copy()
-    draw_boxes(vis_overlay, gt_xyxy, color="lime", width=3)  # GT
-    if args.annotate_scores and pred_xyxy.numel() > 0:
+    draw_labeled_boxes(vis_overlay, gt_xyxy, labels=gt_labels, color="lime", width=3)
+    if det_active and args.annotate_scores and pred_xyxy.numel() > 0:
         labels = [f"{_round4(s)}" for s in pred_scores.tolist()]
         draw_labeled_boxes(vis_overlay, pred_xyxy, labels=labels, color="red", width=2)
-    else:
+    elif det_active:
         draw_boxes(vis_overlay, pred_xyxy, color="red", width=2)  # Pred
-    draw_boxes(vis_overlay, lm_xyxy, color="dodgerblue", width=2)  # LM boxes
+    draw_labeled_boxes(vis_overlay, lm_xyxy, labels=lm_labels, color="dodgerblue", width=2)
 
     gt_image_path = _derive_path(args.output_image, "gt")
     pred_image_path = _derive_path(args.output_image, "pred")
@@ -551,9 +572,20 @@ def main() -> None:
     vis_pred.save(pred_image_path)
     vis_lm.save(lm_image_path)
     vis_overlay.save(args.output_image)
-    compare = build_comparison_strip(vis_gt, vis_pred, vis_overlay)
+    compare = build_comparison_strip(
+        vis_gt,
+        vis_lm if not det_active else vis_pred,
+        vis_overlay,
+        pred_title=("LM boxes" if not det_active else "Pred"),
+    )
     compare.save(compare_image_path)
-    compare4 = build_four_panel_strip(vis_gt, vis_pred, vis_lm, vis_overlay)
+    compare4 = build_four_panel_strip(
+        vis_gt,
+        vis_pred,
+        vis_lm,
+        vis_overlay,
+        det_title=("DETR n/a" if not det_active else "DETR"),
+    )
     compare4.save(compare4_image_path)
 
     pred_items = []
@@ -595,14 +627,15 @@ def main() -> None:
         "split": args.split,
         "checkpoint_dir": args.checkpoint_dir,
         "base_model_only": bool(args.base_model_only),
+        "detr_active": bool(det_active),
         "image_size": {"width": int(w), "height": int(h)},
         "prompt_user_text": user_text,
         "assistant_text": assistant_text,
         "threshold": float(args.obj_threshold),
         "counts": {
             "gt_count": int(gt_boxes.shape[0]),
-            "pred_count_thresholded_detr": (int(pred_boxes.shape[0]) if obj_prob.numel() > 0 else None),
-            "pred_soft_count_detr": (_round4(soft_count) if soft_count is not None else None),
+            "pred_count_thresholded_detr": (int(pred_boxes.shape[0]) if det_active and obj_prob.numel() > 0 else None),
+            "pred_soft_count_detr": (_round4(soft_count) if det_active and soft_count is not None else None),
             "pred_count_lm_text": int(lm_count_text) if lm_count_text is not None else None,
             "pred_count_lm_boxes": int(lm_boxes.shape[0]),
         },
@@ -641,12 +674,12 @@ def main() -> None:
     print(f"Saved 4-panel compare: {compare4_image_path}")
     print(f"Saved prediction json: {out_json}")
     print(f"GT count: {gt_boxes.shape[0]}")
-    if obj_prob.numel() > 0:
+    if det_active and obj_prob.numel() > 0:
         print(f"Pred count DETR (@{args.obj_threshold:.2f}): {pred_boxes.shape[0]}")
         print(f"Pred soft count DETR (sum probs): {soft_count:.2f}")
     else:
-        print("Pred count DETR: n/a (base-model-only mode)")
-        print("Pred soft count DETR: n/a (base-model-only mode)")
+        print("Pred count DETR: n/a (DETR inactive for this checkpoint)")
+        print("Pred soft count DETR: n/a (DETR inactive for this checkpoint)")
     print(f"Pred count LM text: {lm_count_text if lm_count_text is not None else 'n/a'}")
     print(f"Pred count LM parsed boxes: {int(lm_boxes.shape[0])}")
     print(
@@ -677,7 +710,7 @@ def main() -> None:
                 "h_mean": round(float(gt_boxes[:, 3].mean()), 4),
             },
         )
-    if pred_boxes.numel() > 0:
+    if det_active and pred_boxes.numel() > 0:
         print(
             "Pred box stats (norm cxcywh):",
             {
@@ -687,7 +720,7 @@ def main() -> None:
                 "h_mean": round(float(pred_boxes[:, 3].mean()), 4),
             },
         )
-    if obj_prob.numel() > 0:
+    if det_active and obj_prob.numel() > 0:
         print("Pred objectness (first 10):", [round(float(x), 4) for x in obj_prob[:10].detach().cpu()])
         print(f"Top-{topk} queries by objectness:")
         for item in top_items:

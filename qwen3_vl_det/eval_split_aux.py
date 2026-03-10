@@ -40,12 +40,12 @@ from qwen3_vl_det.train_sharegpt import (
 class EvalRow:
     index: int
     gt_count: int
-    pred_count_detr: int
-    pred_count_soft_detr: float
-    abs_error_detr: int
-    precision_detr: float
-    recall_detr: float
-    f1_detr: float
+    pred_count_detr: int | None
+    pred_count_soft_detr: float | None
+    abs_error_detr: int | None
+    precision_detr: float | None
+    recall_detr: float | None
+    f1_detr: float | None
     pred_count_lm_text: int | None
     abs_error_lm_text: int | None
     pred_count_lm_boxes: int
@@ -104,7 +104,23 @@ def bucket_from_gt_count(gt_count: int, easy_max: int, medium_max: int, hard_max
     return "extreme"
 
 
-def aggregate_det_metrics(rows: list[EvalRow]) -> dict[str, float]:
+def _na_det_metrics() -> dict[str, float | None]:
+    return {
+        "count_mae": None,
+        "count_soft_mae": None,
+        "count_accuracy": None,
+        "precision": None,
+        "recall": None,
+        "f1": None,
+    }
+
+
+def aggregate_det_metrics(rows: list[EvalRow], det_active: bool) -> dict[str, float | None]:
+    if not det_active:
+        return _na_det_metrics()
+    valid = [r for r in rows if r.abs_error_detr is not None and r.pred_count_soft_detr is not None]
+    if not valid:
+        return _na_det_metrics()
     if not rows:
         return {
             "count_mae": 0.0,
@@ -114,12 +130,12 @@ def aggregate_det_metrics(rows: list[EvalRow]) -> dict[str, float]:
             "recall": 0.0,
             "f1": 0.0,
         }
-    count_mae = sum(r.abs_error_detr for r in rows) / len(rows)
-    count_soft_mae = sum(abs(r.pred_count_soft_detr - r.gt_count) for r in rows) / len(rows)
-    count_acc = sum(1.0 for r in rows if r.abs_error_detr == 0) / len(rows)
-    precision = sum(r.precision_detr for r in rows) / len(rows)
-    recall = sum(r.recall_detr for r in rows) / len(rows)
-    f1 = sum(r.f1_detr for r in rows) / len(rows)
+    count_mae = sum(int(r.abs_error_detr) for r in valid) / len(valid)
+    count_soft_mae = sum(abs(float(r.pred_count_soft_detr) - r.gt_count) for r in valid) / len(valid)
+    count_acc = sum(1.0 for r in valid if r.abs_error_detr == 0) / len(valid)
+    precision = sum(float(r.precision_detr) for r in valid) / len(valid)
+    recall = sum(float(r.recall_detr) for r in valid) / len(valid)
+    f1 = sum(float(r.f1_detr) for r in valid) / len(valid)
     return {
         "count_mae": count_mae,
         "count_soft_mae": count_soft_mae,
@@ -272,6 +288,14 @@ def draw_boxes(img, boxes_xyxy: torch.Tensor, color: str, width: int = 3) -> Non
         draw.rectangle(b, outline=color, width=width)
 
 
+def _checkpoint_uses_detr(train_args: dict[str, Any], branch_cfg: AuxDetrBranchConfig) -> bool:
+    try:
+        det_weight = float(train_args.get("det_weight", 0.0))
+    except Exception:
+        det_weight = 0.0
+    return det_weight > 0.0 or bool(getattr(branch_cfg, "inject_det_queries_to_lm", False))
+
+
 def build_model_and_processor(args: argparse.Namespace):
     ckpt_dir = args.checkpoint_dir
     train_args_path = os.path.join(ckpt_dir, "train_args.json")
@@ -371,6 +395,7 @@ def main() -> None:
     model, tokenizer, processor, dino_processor, use_vision, train_args = build_model_and_processor(args)
     if not use_vision:
         print("WARNING: running without vision tensors; metrics are not valid for real detection.")
+    det_active = _checkpoint_uses_detr(train_args, model.branch_cfg)
 
     ckpt_mode = str(train_args.get("box_coord_mode", "")).lower()
     ckpt_order = str(train_args.get("box_coord_order", "")).lower()
@@ -470,23 +495,27 @@ def main() -> None:
                 raise RuntimeError("DINO processor did not return pixel_values at eval.")
             inputs["dino_pixel_values"] = dino_inputs["pixel_values"].to(args.device)
 
-        with torch.no_grad():
-            out = model(
-                input_ids=inputs["input_ids"],
-                attention_mask=inputs.get("attention_mask"),
-                pixel_values=inputs.get("pixel_values"),
-                image_grid_thw=inputs.get("image_grid_thw"),
-                dino_pixel_values=inputs.get("dino_pixel_values"),
-                det_enabled=True,
-                return_det=True,
-            )
-            obj_prob = out["det_obj_logits"].sigmoid()[0]
-            box_pred = out["det_boxes"][0]
-
-        keep = obj_prob >= args.obj_threshold
-        pred_boxes = box_pred[keep].detach().cpu()
-        pred_xyxy = cxcywh_to_xyxy_abs(pred_boxes, width=w, height=h)
-        pred_count_soft = float(obj_prob.sum().detach().cpu().item())
+        if det_active:
+            with torch.no_grad():
+                out = model(
+                    input_ids=inputs["input_ids"],
+                    attention_mask=inputs.get("attention_mask"),
+                    pixel_values=inputs.get("pixel_values"),
+                    image_grid_thw=inputs.get("image_grid_thw"),
+                    dino_pixel_values=inputs.get("dino_pixel_values"),
+                    det_enabled=True,
+                    return_det=True,
+                )
+                obj_prob = out["det_obj_logits"].sigmoid()[0]
+                box_pred = out["det_boxes"][0]
+            keep = obj_prob >= args.obj_threshold
+            pred_boxes = box_pred[keep].detach().cpu()
+            pred_xyxy = cxcywh_to_xyxy_abs(pred_boxes, width=w, height=h)
+            pred_count_soft = float(obj_prob.sum().detach().cpu().item())
+        else:
+            pred_boxes = torch.zeros((0, 4), dtype=torch.float32)
+            pred_xyxy = torch.zeros((0, 4), dtype=torch.float32)
+            pred_count_soft = None
 
         gt_boxes = extract_gt_boxes_from_example(
             ex,
@@ -499,7 +528,10 @@ def main() -> None:
         )
         gt_xyxy = cxcywh_to_xyxy_abs(gt_boxes, width=w, height=h)
 
-        precision, recall, f1 = detection_prf(pred_xyxy, gt_xyxy, iou_thr=args.iou_threshold)
+        if det_active:
+            precision, recall, f1 = detection_prf(pred_xyxy, gt_xyxy, iou_thr=args.iou_threshold)
+        else:
+            precision, recall, f1 = None, None, None
         lm_pred_count_text: int | None = None
         lm_abs_error_text: int | None = None
         lm_pred_count_boxes = 0
@@ -559,13 +591,13 @@ def main() -> None:
                 )
 
         gt_count = int(gt_boxes.shape[0])
-        pred_count = int(pred_boxes.shape[0])
+        pred_count = (int(pred_boxes.shape[0]) if det_active else None)
         row = EvalRow(
             index=idx,
             gt_count=gt_count,
             pred_count_detr=pred_count,
             pred_count_soft_detr=pred_count_soft,
-            abs_error_detr=abs(pred_count - gt_count),
+            abs_error_detr=(abs(int(pred_count) - gt_count) if pred_count is not None else None),
             precision_detr=precision,
             recall_detr=recall,
             f1_detr=f1,
@@ -588,24 +620,35 @@ def main() -> None:
         if args.save_overlays and ((idx - start) % max(args.overlay_every, 1) == 0):
             vis = img.copy()
             draw_boxes(vis, gt_xyxy, color="lime", width=3)
-            draw_boxes(vis, pred_xyxy, color="red", width=2)
+            if det_active:
+                draw_boxes(vis, pred_xyxy, color="red", width=2)
             if args.eval_lm_generation:
                 draw_boxes(vis, lm_xyxy, color="dodgerblue", width=2)
             vis.save(os.path.join(args.overlay_dir, f"sample_{idx}.png"))
 
         if (idx - start + 1) % 50 == 0:
             recent = rows[-50:]
-            mae = sum(r.abs_error_detr for r in recent) / len(recent)
-            lm_mae = sum(r.abs_error_lm_boxes for r in recent) / len(recent)
-            print(
-                f"processed={idx-start+1}/{end-start}, recent_mae_detr={mae:.3f}, "
-                f"recent_mae_lm_boxes={lm_mae:.3f}"
+            mae = (
+                sum(int(r.abs_error_detr) for r in recent if r.abs_error_detr is not None) / len(recent)
+                if det_active
+                else None
             )
+            lm_mae = sum(r.abs_error_lm_boxes for r in recent) / len(recent)
+            if det_active and mae is not None:
+                print(
+                    f"processed={idx-start+1}/{end-start}, recent_mae_detr={mae:.3f}, "
+                    f"recent_mae_lm_boxes={lm_mae:.3f}"
+                )
+            else:
+                print(
+                    f"processed={idx-start+1}/{end-start}, recent_mae_detr=n/a, "
+                    f"recent_mae_lm_boxes={lm_mae:.3f}"
+                )
 
     if not rows:
         raise RuntimeError("No samples evaluated.")
 
-    metrics_det = aggregate_det_metrics(rows)
+    metrics_det = aggregate_det_metrics(rows, det_active=det_active)
     metrics_lm_text = aggregate_lm_text_metrics(rows)
     metrics_lm_boxes = aggregate_lm_box_metrics(rows)
 
@@ -619,7 +662,7 @@ def main() -> None:
     bucket_metrics: dict[str, dict[str, float | int | str]] = {}
     for bucket in bucket_order:
         b_rows = [r for r in rows if r.bucket == bucket]
-        b_metrics_det = aggregate_det_metrics(b_rows)
+        b_metrics_det = aggregate_det_metrics(b_rows, det_active=det_active)
         b_metrics_lm_text = aggregate_lm_text_metrics(b_rows)
         b_metrics_lm_boxes = aggregate_lm_box_metrics(b_rows)
         bucket_metrics[bucket] = {
@@ -651,6 +694,7 @@ def main() -> None:
             "hard_max": args.hard_max,
         },
         "vision_enabled": bool(use_vision),
+        "detr_active": bool(det_active),
         "eval_lm_generation": bool(args.eval_lm_generation),
         "metrics": metrics_det,
         "metrics_detr": metrics_det,
@@ -663,8 +707,11 @@ def main() -> None:
     with open(args.output_json, "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
 
-    print("DETR metrics:")
-    print(json.dumps(summary["metrics_detr"], indent=2))
+    if det_active:
+        print("DETR metrics:")
+        print(json.dumps(summary["metrics_detr"], indent=2))
+    else:
+        print("DETR metrics: n/a (DETR inactive for this checkpoint)")
     print("LM text-count metrics:")
     print(json.dumps(summary["metrics_lm_text"], indent=2))
     print("LM generated-box metrics:")
@@ -672,11 +719,17 @@ def main() -> None:
     print("Bucket metrics:")
     for bucket in bucket_order:
         bm = bucket_metrics[bucket]
-        print(
-            f"  {bucket:<7} range={bm['range']:<8} n={bm['num_samples']:<4} "
-            f"mae={bm['count_mae']:.3f} soft_mae={bm['count_soft_mae']:.3f} acc={bm['count_accuracy']:.3f} "
-            f"p={bm['precision']:.3f} r={bm['recall']:.3f} f1={bm['f1']:.3f}"
-        )
+        if det_active:
+            print(
+                f"  {bucket:<7} range={bm['range']:<8} n={bm['num_samples']:<4} "
+                f"mae={bm['count_mae']:.3f} soft_mae={bm['count_soft_mae']:.3f} acc={bm['count_accuracy']:.3f} "
+                f"p={bm['precision']:.3f} r={bm['recall']:.3f} f1={bm['f1']:.3f}"
+            )
+        else:
+            print(
+                f"  {bucket:<7} range={bm['range']:<8} n={bm['num_samples']:<4} "
+                "mae=n/a soft_mae=n/a acc=n/a p=n/a r=n/a f1=n/a"
+            )
         lm_t = bm["lm_text"]
         lm_b = bm["lm_boxes"]
         print(

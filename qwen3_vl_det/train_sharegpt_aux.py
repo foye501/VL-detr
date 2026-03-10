@@ -51,6 +51,7 @@ class TrainAuxArgs:
     train_split: str = "train"
     model_name: str = "Qwen/Qwen3-VL-2B-Instruct"
     output_dir: str = "qwen3_vl_det/checkpoints_aux"
+    resume_from_checkpoint: str = ""
     num_queries: int = 100
     image_token_id: int = -1  # set >=0 to bypass auto inference
     batch_size: int = 1
@@ -126,6 +127,7 @@ def parse_args() -> TrainAuxArgs:
     p.add_argument("--train-split", default=TrainAuxArgs.train_split)
     p.add_argument("--model-name", default=TrainAuxArgs.model_name)
     p.add_argument("--output-dir", default=TrainAuxArgs.output_dir)
+    p.add_argument("--resume-from-checkpoint", default=TrainAuxArgs.resume_from_checkpoint)
     p.add_argument("--num-queries", type=int, default=TrainAuxArgs.num_queries)
     p.add_argument("--image-token-id", type=int, default=TrainAuxArgs.image_token_id)
     p.add_argument("--batch-size", type=int, default=TrainAuxArgs.batch_size)
@@ -775,6 +777,16 @@ def main() -> None:
     os.makedirs(args.output_dir, exist_ok=True)
     torch.manual_seed(args.seed)
     random.seed(args.seed)
+    resume_dir = args.resume_from_checkpoint.strip()
+    resume_train_args: dict[str, Any] = {}
+    if resume_dir:
+        if not os.path.isdir(resume_dir):
+            raise FileNotFoundError(f"--resume-from-checkpoint not found: {resume_dir}")
+        print(f"Resuming training from checkpoint: {resume_dir}")
+        resume_train_args_path = os.path.join(resume_dir, "train_args.json")
+        if os.path.exists(resume_train_args_path):
+            with open(resume_train_args_path, "r", encoding="utf-8") as f:
+                resume_train_args = json.load(f)
 
     token = args.hf_token if args.hf_token else True
     ds = load_split_dataset(
@@ -787,8 +799,15 @@ def main() -> None:
         ds = ds.select(range(min(args.max_samples, len(ds))))
     print(f"Loaded dataset: {args.dataset_name} split={args.train_split} size={len(ds)}")
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True)
-    processor, use_vision = load_processor(args.model_name, tokenizer)
+    tokenizer_source = args.model_name
+    processor_source = args.model_name
+    if resume_dir:
+        if os.path.exists(os.path.join(resume_dir, "tokenizer_config.json")):
+            tokenizer_source = resume_dir
+        if os.path.exists(os.path.join(resume_dir, "preprocessor_config.json")):
+            processor_source = resume_dir
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, trust_remote_code=True)
+    processor, use_vision = load_processor(processor_source, tokenizer)
     if args.require_vision and not use_vision:
         raise RuntimeError(
             "Vision processor failed to load. Install compatible vision deps (e.g., torchvision) "
@@ -856,13 +875,55 @@ def main() -> None:
         dino_cross_attn_dropout=float(args.dino_cross_attn_dropout),
         dino_gate_init=float(args.dino_gate_init),
     )
+    resume_adapter_state: dict[str, Any] | None = None
+    if resume_dir:
+        resume_adapter_path = os.path.join(resume_dir, "adapter.pt")
+        if os.path.exists(resume_adapter_path):
+            resume_adapter_state = torch.load(resume_adapter_path, map_location="cpu")
+            if "num_queries" in resume_adapter_state:
+                ckpt_num_queries = int(resume_adapter_state["num_queries"])
+                if ckpt_num_queries != int(args.num_queries):
+                    print(
+                        f"INFO: overriding --num-queries {args.num_queries} "
+                        f"with resumed checkpoint value {ckpt_num_queries}"
+                    )
+                    args.num_queries = ckpt_num_queries
+            if "branch_cfg" in resume_adapter_state and isinstance(resume_adapter_state["branch_cfg"], dict):
+                branch_cfg = AuxDetrBranchConfig(**resume_adapter_state["branch_cfg"])
+            if "hungarian_cfg" in resume_adapter_state and isinstance(resume_adapter_state["hungarian_cfg"], dict):
+                for k, v in resume_adapter_state["hungarian_cfg"].items():
+                    if hasattr(HungarianLossConfig, "__dataclass_fields__") and k in HungarianLossConfig.__dataclass_fields__:
+                        setattr(args, {
+                            "class_cost": "class_cost",
+                            "bbox_cost": "bbox_cost",
+                            "giou_cost": "giou_cost",
+                            "no_object_weight": "no_object_weight",
+                            "count_loss_weight": "count_loss_weight",
+                            "count_loss_normalize_by_queries": "count_loss_normalize_by_queries",
+                        }.get(k, k), v)
+            if "loss_cfg" in resume_adapter_state and isinstance(resume_adapter_state["loss_cfg"], dict):
+                if "lm_weight" in resume_adapter_state["loss_cfg"]:
+                    args.lm_weight = float(resume_adapter_state["loss_cfg"]["lm_weight"])
+                if "det_weight" in resume_adapter_state["loss_cfg"]:
+                    args.det_weight = float(resume_adapter_state["loss_cfg"]["det_weight"])
+    model_source = resume_dir or args.model_name
     model = Qwen3VLAuxDetrAdapter.from_pretrained(
-        args.model_name,
+        model_source,
         num_queries=args.num_queries,
         branch_cfg=branch_cfg,
         trust_remote_code=True,
         dtype=torch.bfloat16 if args.device.startswith("cuda") else torch.float32,
     )
+    if resume_adapter_state is not None:
+        missing, unexpected = model.load_state_dict(
+            resume_adapter_state.get("adapter_state_dict", {}),
+            strict=False,
+        )
+        if missing or unexpected:
+            print(
+                "INFO: resumed adapter state loaded with "
+                f"missing={len(missing)} unexpected={len(unexpected)}"
+            )
     if added_det_query_tokens > 0 or added_dino_patch_tokens > 0:
         model.base_model.resize_token_embeddings(len(tokenizer))
         print(f"Resized token embeddings to {len(tokenizer)}")
@@ -1019,15 +1080,48 @@ def main() -> None:
 
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(trainable_params, lr=args.lr)
-
+    start_epoch = 0
     global_step = 0
+    if resume_dir:
+        training_state_path = os.path.join(resume_dir, "training_state.pt")
+        if os.path.exists(training_state_path):
+            training_state = torch.load(training_state_path, map_location="cpu")
+            start_epoch = int(training_state.get("completed_epochs", 0))
+            global_step = int(training_state.get("global_step", 0))
+            optimizer_state = training_state.get("optimizer_state_dict")
+            if optimizer_state is not None:
+                try:
+                    optimizer.load_state_dict(optimizer_state)
+                    print(
+                        f"Loaded optimizer state from {training_state_path} "
+                        f"(epoch={start_epoch}, global_step={global_step})"
+                    )
+                except Exception as exc:
+                    print(
+                        "WARNING: failed to load optimizer state from resume checkpoint: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+            else:
+                print(
+                    f"Loaded resume metadata from {training_state_path} "
+                    f"(epoch={start_epoch}, global_step={global_step})"
+                )
+        else:
+            start_epoch = int(resume_train_args.get("epochs", 0) or 0)
+            print(
+                "WARNING: resume checkpoint has no training_state.pt; continuing with fresh optimizer state "
+                f"(starting epoch index at {start_epoch})."
+            )
+
+    stop_global_step = (global_step + int(args.max_steps)) if args.max_steps > 0 else 0
     debug_dump_done = False
     optimizer.zero_grad(set_to_none=True)
-    for epoch in range(args.epochs):
+    completed_epochs = start_epoch
+    for epoch in range(start_epoch, start_epoch + args.epochs):
         for _, batch in enumerate(loader):
-            global_step += 1
-            if args.max_steps > 0 and global_step > args.max_steps:
+            if stop_global_step > 0 and global_step >= stop_global_step:
                 break
+            global_step += 1
 
             batch_cpu = batch
             batch = to_device(batch, args.device)
@@ -1085,7 +1179,8 @@ def main() -> None:
                     batch_dev=batch,
                 )
 
-        if args.max_steps > 0 and global_step >= args.max_steps:
+        completed_epochs = epoch + 1
+        if stop_global_step > 0 and global_step >= stop_global_step:
             break
 
     ckpt_dir = os.path.join(args.output_dir, "last")
@@ -1124,6 +1219,14 @@ def main() -> None:
             "use_lora": bool(args.use_lora),
         },
         os.path.join(ckpt_dir, "adapter.pt"),
+    )
+    torch.save(
+        {
+            "global_step": int(global_step),
+            "completed_epochs": int(completed_epochs),
+            "optimizer_state_dict": optimizer.state_dict(),
+        },
+        os.path.join(ckpt_dir, "training_state.pt"),
     )
     with open(os.path.join(ckpt_dir, "train_args.json"), "w", encoding="utf-8") as f:
         json.dump(asdict(args), f, indent=2)

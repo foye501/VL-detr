@@ -14,6 +14,7 @@ DATASET_FROM_DISK="${DATASET_FROM_DISK:-}"
 SPLIT="${SPLIT:-train}"
 
 OUTPUT_DIR="${OUTPUT_DIR:-qwen3_vl_det/checkpoints_dino_fused_visual_boxcount}"
+RESUME_FROM_CHECKPOINT="${RESUME_FROM_CHECKPOINT:-}"
 NUM_QUERIES="${NUM_QUERIES:-100}"
 DINO_LM_NUM_TOKENS="${DINO_LM_NUM_TOKENS:-16}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
@@ -91,6 +92,9 @@ train_cmd=(
   --log-lm-generate-every "${LOG_LM_GENERATE_EVERY}"
   --log-lm-generate-max-new-tokens "${LOG_LM_GENERATE_MAX_NEW_TOKENS}"
 )
+if [[ -n "${RESUME_FROM_CHECKPOINT}" ]]; then
+  train_cmd+=(--resume-from-checkpoint "${RESUME_FROM_CHECKPOINT}")
+fi
 
 if [[ -n "${DATASET_FROM_DISK}" ]]; then
   train_cmd+=(--dataset-from-disk "${DATASET_FROM_DISK}")

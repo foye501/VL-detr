@@ -13,7 +13,16 @@ import torch
 from PIL import Image, ImageDraw
 from transformers import AutoImageProcessor, AutoTokenizer
 
-from qwen3_vl_det.modeling import AuxDetrBranchConfig, Qwen3VLAuxDetrAdapter
+from qwen3_vl_det.modeling import (
+    AutoModelForCausalLM,
+    AutoModelForImageTextToText,
+    AutoModelForVision2Seq,
+    AuxDetrBranchConfig,
+    Qwen2_5_VLForConditionalGeneration,
+    Qwen2VLForConditionalGeneration,
+    Qwen3VLAuxDetrAdapter,
+    Qwen3VLForConditionalGeneration,
+)
 from qwen3_vl_det.train_sharegpt import (
     BOX_SUPERVISION_CHOICES,
     DET_QUERY_TOKEN,
@@ -33,6 +42,7 @@ from qwen3_vl_det.train_sharegpt import (
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Evaluate one sample with auxiliary DETR branch.")
     p.add_argument("--checkpoint-dir", required=True)
+    p.add_argument("--base-model-only", action="store_true")
     p.add_argument("--dataset-name", default="foye501/VLM-Counting-dataset-qwenvl-sharegpt")
     p.add_argument("--dataset-from-disk", default="")
     p.add_argument("--split", default="train")
@@ -61,6 +71,49 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lm-box-parse-order", choices=["auto", "xyxy", "yxyx"], default="auto")
     p.set_defaults(eval_lm_generation=True)
     return p.parse_args()
+
+
+def load_plain_base_model(
+    model_name_or_path: str,
+    *,
+    dtype: torch.dtype,
+    device: str,
+) -> tuple[torch.nn.Module, str]:
+    loaders = []
+    if Qwen3VLForConditionalGeneration is not None:
+        loaders.append(Qwen3VLForConditionalGeneration)
+    if Qwen2_5_VLForConditionalGeneration is not None:
+        loaders.append(Qwen2_5_VLForConditionalGeneration)
+    if Qwen2VLForConditionalGeneration is not None:
+        loaders.append(Qwen2VLForConditionalGeneration)
+    if AutoModelForImageTextToText is not None:
+        loaders.append(AutoModelForImageTextToText)
+    if AutoModelForVision2Seq is not None:
+        loaders.append(AutoModelForVision2Seq)
+    loaders.append(AutoModelForCausalLM)
+
+    load_errors: list[str] = []
+    model = None
+    loaded_with = ""
+    for loader in loaders:
+        try:
+            model = loader.from_pretrained(
+                model_name_or_path,
+                trust_remote_code=True,
+                dtype=dtype,
+            )
+            loaded_with = getattr(loader, "__name__", str(loader))
+            break
+        except Exception as exc:
+            load_errors.append(f"{getattr(loader, '__name__', str(loader))}: {exc}")
+    if model is None:
+        raise RuntimeError(
+            "Could not load base model with any supported loader. Errors:\n"
+            + "\n".join(load_errors)
+        )
+    model.to(device)
+    model.eval()
+    return model, loaded_with
 
 
 def cxcywh_to_xyxy_abs(boxes: torch.Tensor, width: int, height: int) -> torch.Tensor:
@@ -186,9 +239,10 @@ def main() -> None:
     w, h = img.size
 
     ckpt_dir = args.checkpoint_dir
+    is_local_ckpt = os.path.isdir(ckpt_dir)
     train_args_path = os.path.join(ckpt_dir, "train_args.json")
     train_args: dict[str, Any] = {}
-    if os.path.exists(train_args_path):
+    if is_local_ckpt and os.path.exists(train_args_path):
         with open(train_args_path, "r", encoding="utf-8") as f:
             train_args = json.load(f)
     ckpt_lm_mode = str(train_args.get("lm_box_output_mode", "")).lower()
@@ -200,14 +254,16 @@ def main() -> None:
     if effective_lm_parse_order == "auto" and ckpt_lm_order in ("xyxy", "yxyx"):
         effective_lm_parse_order = ckpt_lm_order
 
-    tokenizer_path = ckpt_dir if os.path.exists(os.path.join(ckpt_dir, "tokenizer_config.json")) else args.model_name
+    tokenizer_path = ckpt_dir if is_local_ckpt and os.path.exists(os.path.join(ckpt_dir, "tokenizer_config.json")) else args.model_name
+    if args.base_model_only and not tokenizer_path:
+        tokenizer_path = ckpt_dir
     if not tokenizer_path:
         raise ValueError("Tokenizer not found in checkpoint; provide --model-name.")
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
 
     if args.model_name:
         processor_model = args.model_name
-    elif os.path.exists(os.path.join(ckpt_dir, "preprocessor_config.json")):
+    elif is_local_ckpt and os.path.exists(os.path.join(ckpt_dir, "preprocessor_config.json")):
         processor_model = ckpt_dir
     elif "model_name" in train_args and train_args["model_name"]:
         processor_model = str(train_args["model_name"])
@@ -221,48 +277,58 @@ def main() -> None:
     branch_cfg = AuxDetrBranchConfig()
     adapter_path = os.path.join(ckpt_dir, "adapter.pt")
     ckpt_num_queries = int(args.num_queries)
-    if os.path.exists(adapter_path):
+    if (not args.base_model_only) and is_local_ckpt and os.path.exists(adapter_path):
         adapter_state = torch.load(adapter_path, map_location="cpu")
         if "num_queries" in adapter_state:
             ckpt_num_queries = int(adapter_state["num_queries"])
         if "branch_cfg" in adapter_state and isinstance(adapter_state["branch_cfg"], dict):
             branch_cfg = AuxDetrBranchConfig(**adapter_state["branch_cfg"])
-    if ckpt_num_queries != int(args.num_queries):
+    if (not args.base_model_only) and ckpt_num_queries != int(args.num_queries):
         print(f"INFO: overriding --num-queries {args.num_queries} with checkpoint value {ckpt_num_queries}")
     args.num_queries = ckpt_num_queries
 
-    model = Qwen3VLAuxDetrAdapter.from_pretrained(
-        ckpt_dir,
-        num_queries=args.num_queries,
-        branch_cfg=branch_cfg,
-        trust_remote_code=True,
-        dtype=torch.bfloat16 if args.device.startswith("cuda") else torch.float32,
-    )
-    if adapter_state is not None:
-        model.load_state_dict(adapter_state["adapter_state_dict"], strict=False)
+    load_dtype = torch.bfloat16 if args.device.startswith("cuda") else torch.float32
+    base_model_load_source = args.model_name or ckpt_dir
+    if args.base_model_only:
+        model, loaded_with = load_plain_base_model(
+            base_model_load_source,
+            dtype=load_dtype,
+            device=args.device,
+        )
+        print(f"Base-model-only mode: loaded with {loaded_with} from {base_model_load_source}")
     else:
-        print("WARNING: adapter.pt not found; using randomly initialized adapter heads.")
-    model.to(args.device)
-    model.eval()
+        model = Qwen3VLAuxDetrAdapter.from_pretrained(
+            ckpt_dir,
+            num_queries=args.num_queries,
+            branch_cfg=branch_cfg,
+            trust_remote_code=True,
+            dtype=load_dtype,
+        )
+        if adapter_state is not None:
+            model.load_state_dict(adapter_state["adapter_state_dict"], strict=False)
+        else:
+            print("WARNING: adapter.pt not found; using randomly initialized adapter heads.")
+        model.to(args.device)
+        model.eval()
     dino_processor = None
-    if bool(getattr(branch_cfg, "use_dino_fusion", False)):
+    if (not args.base_model_only) and bool(getattr(branch_cfg, "use_dino_fusion", False)):
         dino_model_name = str(getattr(branch_cfg, "dino_model_name", "")).strip()
         if not dino_model_name:
             raise RuntimeError("Checkpoint enables DINO fusion but has empty dino_model_name.")
         dino_processor = AutoImageProcessor.from_pretrained(dino_model_name)
         print(f"DINO fusion active: {dino_model_name}")
-    if bool(getattr(branch_cfg, "inject_det_queries_to_lm", False)):
+    if (not args.base_model_only) and bool(getattr(branch_cfg, "inject_det_queries_to_lm", False)):
         print(
             "LM fusion mode: enabled "
             f"(det_query_token_id={getattr(branch_cfg, 'det_query_token_id', None)})"
         )
-    if bool(getattr(branch_cfg, "inject_dino_tokens_to_lm", False)):
+    if (not args.base_model_only) and bool(getattr(branch_cfg, "inject_dino_tokens_to_lm", False)):
         print(
             "LM fusion mode: direct DINO "
             f"(dino_lm_token_id={getattr(branch_cfg, 'dino_lm_token_id', None)}, "
             f"num_tokens={getattr(branch_cfg, 'dino_lm_num_tokens', None)})"
         )
-    if bool(getattr(branch_cfg, "inject_fused_visual_tokens_to_lm", False)):
+    if (not args.base_model_only) and bool(getattr(branch_cfg, "inject_fused_visual_tokens_to_lm", False)):
         print(
             "LM fusion mode: fused visual "
             f"(dino_lm_token_id={getattr(branch_cfg, 'dino_lm_token_id', None)}, "
@@ -270,14 +336,17 @@ def main() -> None:
         )
 
     user_text = user_text.replace("<image>", "").replace("<|image_pad|>", "").strip()
-    if bool(getattr(branch_cfg, "inject_det_queries_to_lm", False)) and (
+    if (not args.base_model_only) and bool(getattr(branch_cfg, "inject_det_queries_to_lm", False)) and (
         getattr(branch_cfg, "det_query_token_id", None) is not None
     ):
         query_text = " ".join([DET_QUERY_TOKEN] * max(int(args.num_queries), 1))
         user_text = f"{user_text}\n{query_text}"
     if (
+        (not args.base_model_only)
+        and (
         bool(getattr(branch_cfg, "inject_dino_tokens_to_lm", False))
         or bool(getattr(branch_cfg, "inject_fused_visual_tokens_to_lm", False))
+        )
     ) and (
         getattr(branch_cfg, "dino_lm_token_id", None) is not None
     ):
@@ -324,18 +393,23 @@ def main() -> None:
     if "dino_pixel_values" in inputs and torch.is_tensor(inputs["dino_pixel_values"]):
         print(f"DINO pixel_values shape: {tuple(inputs['dino_pixel_values'].shape)}")
 
-    with torch.no_grad():
-        out = model(
-            input_ids=inputs["input_ids"],
-            attention_mask=inputs.get("attention_mask"),
-            pixel_values=inputs.get("pixel_values"),
-            image_grid_thw=inputs.get("image_grid_thw"),
-            dino_pixel_values=inputs.get("dino_pixel_values"),
-            det_enabled=True,
-            return_det=True,
-        )
-        obj_prob = out["det_obj_logits"].sigmoid()[0]
-        box_pred = out["det_boxes"][0]
+    out: dict[str, Any] = {}
+    if args.base_model_only:
+        obj_prob = torch.zeros((0,), dtype=torch.float32)
+        box_pred = torch.zeros((0, 4), dtype=torch.float32)
+    else:
+        with torch.no_grad():
+            out = model(
+                input_ids=inputs["input_ids"],
+                attention_mask=inputs.get("attention_mask"),
+                pixel_values=inputs.get("pixel_values"),
+                image_grid_thw=inputs.get("image_grid_thw"),
+                dino_pixel_values=inputs.get("dino_pixel_values"),
+                det_enabled=True,
+                return_det=True,
+            )
+            obj_prob = out["det_obj_logits"].sigmoid()[0]
+            box_pred = out["det_boxes"][0]
 
     lm_generated_text = ""
     lm_count_text: int | None = None
@@ -355,7 +429,10 @@ def main() -> None:
         if "dino_pixel_values" in inputs:
             gen_kwargs["dino_pixel_values"] = inputs.get("dino_pixel_values")
         with torch.no_grad():
-            gen_ids = model.generate_with_visual_injection(**gen_kwargs)
+            if args.base_model_only:
+                gen_ids = model.generate(**gen_kwargs)
+            else:
+                gen_ids = model.generate_with_visual_injection(**gen_kwargs)
         gen_trimmed = [
             (out_ids[len(in_ids) :] if out_ids.shape[0] > in_ids.shape[0] else out_ids)
             for in_ids, out_ids in zip(inputs["input_ids"], gen_ids)
@@ -375,17 +452,28 @@ def main() -> None:
         )
         lm_xyxy = cxcywh_to_xyxy_abs(lm_boxes, width=w, height=h)
 
-    keep = obj_prob >= args.obj_threshold
-    pred_boxes = box_pred[keep].detach().cpu()
-    pred_scores = obj_prob[keep].detach().cpu()
-    pred_xyxy = cxcywh_to_xyxy_abs(pred_boxes, width=w, height=h)
-    soft_count = float(obj_prob.sum().detach().cpu().item())
+    if obj_prob.numel() > 0:
+        keep = obj_prob >= args.obj_threshold
+        pred_boxes = box_pred[keep].detach().cpu()
+        pred_scores = obj_prob[keep].detach().cpu()
+        pred_xyxy = cxcywh_to_xyxy_abs(pred_boxes, width=w, height=h)
+        soft_count = float(obj_prob.sum().detach().cpu().item())
 
-    k = max(1, int(args.print_topk))
-    topk = min(k, int(obj_prob.shape[0]))
-    top_scores, top_idx = torch.topk(obj_prob.detach().cpu(), k=topk, largest=True)
-    top_boxes = box_pred.detach().cpu()[top_idx]
-    top_xyxy = cxcywh_to_xyxy_abs(top_boxes, width=w, height=h)
+        k = max(1, int(args.print_topk))
+        topk = min(k, int(obj_prob.shape[0]))
+        top_scores, top_idx = torch.topk(obj_prob.detach().cpu(), k=topk, largest=True)
+        top_boxes = box_pred.detach().cpu()[top_idx]
+        top_xyxy = cxcywh_to_xyxy_abs(top_boxes, width=w, height=h)
+    else:
+        pred_boxes = torch.zeros((0, 4), dtype=torch.float32)
+        pred_scores = torch.zeros((0,), dtype=torch.float32)
+        pred_xyxy = torch.zeros((0, 4), dtype=torch.float32)
+        soft_count = None
+        topk = 0
+        top_scores = torch.zeros((0,), dtype=torch.float32)
+        top_idx = torch.zeros((0,), dtype=torch.long)
+        top_boxes = torch.zeros((0, 4), dtype=torch.float32)
+        top_xyxy = torch.zeros((0, 4), dtype=torch.float32)
 
     raw_boxes = extract_boxes_raw(assistant_text)
     inferred_mode = _infer_box_coord_mode(raw_boxes, width=w, height=h)
@@ -489,14 +577,15 @@ def main() -> None:
         "sample_index": int(args.sample_index),
         "split": args.split,
         "checkpoint_dir": args.checkpoint_dir,
+        "base_model_only": bool(args.base_model_only),
         "image_size": {"width": int(w), "height": int(h)},
         "prompt_user_text": user_text,
         "assistant_text": assistant_text,
         "threshold": float(args.obj_threshold),
         "counts": {
             "gt_count": int(gt_boxes.shape[0]),
-            "pred_count_thresholded_detr": int(pred_boxes.shape[0]),
-            "pred_soft_count_detr": _round4(soft_count),
+            "pred_count_thresholded_detr": (int(pred_boxes.shape[0]) if obj_prob.numel() > 0 else None),
+            "pred_soft_count_detr": (_round4(soft_count) if soft_count is not None else None),
             "pred_count_lm_text": int(lm_count_text) if lm_count_text is not None else None,
             "pred_count_lm_boxes": int(lm_boxes.shape[0]),
         },
@@ -535,8 +624,12 @@ def main() -> None:
     print(f"Saved 4-panel compare: {compare4_image_path}")
     print(f"Saved prediction json: {out_json}")
     print(f"GT count: {gt_boxes.shape[0]}")
-    print(f"Pred count DETR (@{args.obj_threshold:.2f}): {pred_boxes.shape[0]}")
-    print(f"Pred soft count DETR (sum probs): {soft_count:.2f}")
+    if obj_prob.numel() > 0:
+        print(f"Pred count DETR (@{args.obj_threshold:.2f}): {pred_boxes.shape[0]}")
+        print(f"Pred soft count DETR (sum probs): {soft_count:.2f}")
+    else:
+        print("Pred count DETR: n/a (base-model-only mode)")
+        print("Pred soft count DETR: n/a (base-model-only mode)")
     print(f"Pred count LM text: {lm_count_text if lm_count_text is not None else 'n/a'}")
     print(f"Pred count LM parsed boxes: {int(lm_boxes.shape[0])}")
     print(
@@ -577,13 +670,14 @@ def main() -> None:
                 "h_mean": round(float(pred_boxes[:, 3].mean()), 4),
             },
         )
-    print("Pred objectness (first 10):", [round(float(x), 4) for x in obj_prob[:10].detach().cpu()])
-    print(f"Top-{topk} queries by objectness:")
-    for item in top_items:
-        print(
-            f"  q={item['query_idx']:>3} score={item['score']:.4f} "
-            f"cxcywh={item['cxcywh_norm']} xyxy={item['xyxy_abs']}"
-        )
+    if obj_prob.numel() > 0:
+        print("Pred objectness (first 10):", [round(float(x), 4) for x in obj_prob[:10].detach().cpu()])
+        print(f"Top-{topk} queries by objectness:")
+        for item in top_items:
+            print(
+                f"  q={item['query_idx']:>3} score={item['score']:.4f} "
+                f"cxcywh={item['cxcywh_norm']} xyxy={item['xyxy_abs']}"
+            )
     if "det_stats" in out:
         print("Det stats:", json.dumps(out["det_stats"], indent=2))
     if "lm_loss" in out:
@@ -591,7 +685,10 @@ def main() -> None:
     if args.eval_lm_generation:
         print("LM generated text:")
         print(lm_generated_text)
-    print("Branch cfg:", json.dumps(asdict(branch_cfg), indent=2))
+    if args.base_model_only:
+        print("Branch cfg: n/a (base-model-only mode)")
+    else:
+        print("Branch cfg:", json.dumps(asdict(branch_cfg), indent=2))
 
 
 if __name__ == "__main__":

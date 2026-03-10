@@ -517,6 +517,7 @@ class ShareGptAuxCollator:
         out["debug_prompt_texts"] = prompt_texts
         out["debug_user_texts"] = user_texts
         out["debug_assistant_targets"] = assistant_targets
+        out["debug_images"] = images
         return out
 
 
@@ -694,6 +695,7 @@ def _log_lm_preview(
     batch_dev: dict[str, Any],
 ) -> None:
     prompt_texts = batch_cpu.get("debug_prompt_texts")
+    preview_images = batch_cpu.get("debug_images")
     gt_boxes = batch_cpu.get("gt_boxes")
     if not prompt_texts or not isinstance(prompt_texts, list):
         return
@@ -701,18 +703,22 @@ def _log_lm_preview(
     if not prompt_text:
         return
 
-    # Tokenize the prompt-only text. Reuse already-prepared image tensors from the batch.
-    prompt_inputs = processor(
-        text=[prompt_text],
-        padding=True,
-        return_tensors="pt",
-    )
+    prompt_kwargs: dict[str, Any] = {
+        "text": [prompt_text],
+        "padding": True,
+        "return_tensors": "pt",
+    }
+    if isinstance(preview_images, list) and preview_images:
+        prompt_kwargs["images"] = [preview_images[0]]
+    prompt_inputs = processor(**prompt_kwargs)
     prompt_inputs = {
         k: (v.to(args.device) if torch.is_tensor(v) else v)
         for k, v in prompt_inputs.items()
     }
-    for k in ("pixel_values", "image_grid_thw", "dino_pixel_values"):
-        if k in batch_dev and torch.is_tensor(batch_dev[k]):
+    if "dino_pixel_values" in batch_dev and torch.is_tensor(batch_dev["dino_pixel_values"]):
+        prompt_inputs["dino_pixel_values"] = batch_dev["dino_pixel_values"][:1]
+    for k in ("pixel_values", "image_grid_thw"):
+        if k not in prompt_inputs and k in batch_dev and torch.is_tensor(batch_dev[k]):
             prompt_inputs[k] = batch_dev[k][:1]
 
     gen_kwargs: dict[str, Any] = {

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import random
 from dataclasses import asdict, dataclass
@@ -15,7 +16,7 @@ from typing import Any
 
 import torch
 from torch.utils.data import DataLoader
-from transformers import AutoImageProcessor, AutoTokenizer
+from transformers import AutoImageProcessor, AutoTokenizer, get_scheduler
 
 from qwen3_vl_det.hungarian import HungarianLossConfig
 from qwen3_vl_det.modeling import (
@@ -58,6 +59,9 @@ class TrainAuxArgs:
     grad_accum_steps: int = 8
     epochs: int = 1
     lr: float = 2e-5
+    adapter_lr: float = 0.0
+    lr_scheduler_type: str = "constant"
+    warmup_steps: int = 0
     class_cost: float = 1.0
     bbox_cost: float = 5.0
     giou_cost: float = 2.0
@@ -134,6 +138,13 @@ def parse_args() -> TrainAuxArgs:
     p.add_argument("--grad-accum-steps", type=int, default=TrainAuxArgs.grad_accum_steps)
     p.add_argument("--epochs", type=int, default=TrainAuxArgs.epochs)
     p.add_argument("--lr", type=float, default=TrainAuxArgs.lr)
+    p.add_argument("--adapter-lr", type=float, default=TrainAuxArgs.adapter_lr)
+    p.add_argument(
+        "--lr-scheduler-type",
+        choices=["constant", "constant_with_warmup", "linear", "cosine", "cosine_with_restarts", "polynomial"],
+        default=TrainAuxArgs.lr_scheduler_type,
+    )
+    p.add_argument("--warmup-steps", type=int, default=TrainAuxArgs.warmup_steps)
     p.add_argument("--class-cost", type=float, default=TrainAuxArgs.class_cost)
     p.add_argument("--bbox-cost", type=float, default=TrainAuxArgs.bbox_cost)
     p.add_argument("--giou-cost", type=float, default=TrainAuxArgs.giou_cost)
@@ -1078,23 +1089,58 @@ def main() -> None:
         collate_fn=collator,
     )
 
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(trainable_params, lr=args.lr)
+    named_trainable_params = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
+    base_trainable_params = [p for n, p in named_trainable_params if n.startswith("base_model.")]
+    adapter_trainable_params = [p for n, p in named_trainable_params if not n.startswith("base_model.")]
+    adapter_lr = float(args.adapter_lr) if float(args.adapter_lr) > 0 else float(args.lr)
+    optimizer_groups: list[dict[str, Any]] = []
+    if base_trainable_params:
+        optimizer_groups.append({"params": base_trainable_params, "lr": float(args.lr)})
+    if adapter_trainable_params:
+        optimizer_groups.append({"params": adapter_trainable_params, "lr": adapter_lr})
+    optimizer = torch.optim.AdamW(optimizer_groups, lr=float(args.lr))
+    print(
+        "Optimizer param groups: "
+        f"base={len(base_trainable_params)} lr={float(args.lr):.6g}, "
+        f"adapter={len(adapter_trainable_params)} lr={adapter_lr:.6g}"
+    )
     start_epoch = 0
     global_step = 0
+    optimizer_step = 0
+
+    num_update_steps_per_epoch = max(
+        1,
+        math.ceil(max(len(loader), 1) / max(int(args.grad_accum_steps), 1)),
+    )
+    if args.max_steps > 0:
+        requested_update_steps = max(1, math.ceil(int(args.max_steps) / max(int(args.grad_accum_steps), 1)))
+    else:
+        requested_update_steps = max(1, int(args.epochs) * num_update_steps_per_epoch)
+    scheduler = get_scheduler(
+        name=str(args.lr_scheduler_type),
+        optimizer=optimizer,
+        num_warmup_steps=int(args.warmup_steps),
+        num_training_steps=int(requested_update_steps),
+    )
+    print(
+        "LR scheduler: "
+        f"type={args.lr_scheduler_type} warmup_steps={int(args.warmup_steps)} "
+        f"target_update_steps={int(requested_update_steps)}"
+    )
     if resume_dir:
         training_state_path = os.path.join(resume_dir, "training_state.pt")
         if os.path.exists(training_state_path):
             training_state = torch.load(training_state_path, map_location="cpu")
             start_epoch = int(training_state.get("completed_epochs", 0))
             global_step = int(training_state.get("global_step", 0))
+            optimizer_step = int(training_state.get("optimizer_step", global_step // max(int(args.grad_accum_steps), 1)))
             optimizer_state = training_state.get("optimizer_state_dict")
             if optimizer_state is not None:
                 try:
                     optimizer.load_state_dict(optimizer_state)
                     print(
                         f"Loaded optimizer state from {training_state_path} "
-                        f"(epoch={start_epoch}, global_step={global_step})"
+                        f"(epoch={start_epoch}, global_step={global_step}, optimizer_step={optimizer_step})"
                     )
                 except Exception as exc:
                     print(
@@ -1106,6 +1152,16 @@ def main() -> None:
                     f"Loaded resume metadata from {training_state_path} "
                     f"(epoch={start_epoch}, global_step={global_step})"
                 )
+            scheduler_state = training_state.get("scheduler_state_dict")
+            if scheduler_state is not None:
+                try:
+                    scheduler.load_state_dict(scheduler_state)
+                    print("Loaded scheduler state from resume checkpoint.")
+                except Exception as exc:
+                    print(
+                        "WARNING: failed to load scheduler state from resume checkpoint: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
         else:
             start_epoch = int(resume_train_args.get("epochs", 0) or 0)
             print(
@@ -1153,8 +1209,10 @@ def main() -> None:
 
             if global_step % args.grad_accum_steps == 0:
                 if args.grad_clip_norm > 0:
-                    torch.nn.utils.clip_grad_norm_(trainable_params, args.grad_clip_norm)
+                    torch.nn.utils.clip_grad_norm_([p for _, p in named_trainable_params], args.grad_clip_norm)
                 optimizer.step()
+                scheduler.step()
+                optimizer_step += 1
                 optimizer.zero_grad(set_to_none=True)
 
             if global_step % args.log_every == 0:
@@ -1224,7 +1282,9 @@ def main() -> None:
         {
             "global_step": int(global_step),
             "completed_epochs": int(completed_epochs),
+            "optimizer_step": int(optimizer_step),
             "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
         },
         os.path.join(ckpt_dir, "training_state.pt"),
     )

@@ -19,7 +19,10 @@ BATCH_SIZE="${BATCH_SIZE:-1}"
 GRAD_ACCUM="${GRAD_ACCUM:-8}"
 EPOCHS="${EPOCHS:-3}"
 MAX_STEPS="${MAX_STEPS:-0}"
-LR="${LR:-1e-5}"
+LR="${LR:-1e-4}"
+ADAPTER_LR="${ADAPTER_LR:-1e-4}"
+LR_SCHEDULER_TYPE="${LR_SCHEDULER_TYPE:-cosine}"
+WARMUP_STEPS="${WARMUP_STEPS:-20}"
 MAX_LENGTH="${MAX_LENGTH:-4096}"
 
 BOX_MODE="${BOX_MODE:-norm1000}"
@@ -64,6 +67,9 @@ train_cmd=(
   --epochs "${EPOCHS}"
   --max-steps "${MAX_STEPS}"
   --lr "${LR}"
+  --adapter-lr "${ADAPTER_LR}"
+  --lr-scheduler-type "${LR_SCHEDULER_TYPE}"
+  --warmup-steps "${WARMUP_STEPS}"
   --max-length "${MAX_LENGTH}"
   --lm-weight 1.0
   --det-weight 0.0

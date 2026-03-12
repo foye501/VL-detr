@@ -10,6 +10,7 @@ EXPORT_IMAGES="${EXPORT_IMAGES:-1}"
 
 LORA_DIR="${LORA_DIR:-qwen3_vl_det/checkpoints_lora_boxcount_baseline_v2}"
 DINO_DIR="${DINO_DIR:-qwen3_vl_det/checkpoints_dino_fused_visual_boxcount_v2_t64}"
+MODEL_NAME="${MODEL_NAME:-Qwen/Qwen3-VL-2B-Instruct}"
 
 START_INDEX="${START_INDEX:-0}"
 MAX_SAMPLES="${MAX_SAMPLES:-200}"
@@ -58,6 +59,7 @@ fi
 lora_eval_cmd=(
   python -m qwen3_vl_det.eval_split_aux
   --checkpoint-dir "${LORA_DIR}/last"
+  --model-name "${MODEL_NAME}"
   "${eval_common[@]}"
   --output-json "${LORA_JSON}"
 )
@@ -65,6 +67,7 @@ lora_eval_cmd=(
 dino_eval_cmd=(
   python -m qwen3_vl_det.eval_split_aux
   --checkpoint-dir "${DINO_DIR}/last"
+  --model-name "${MODEL_NAME}"
   "${eval_common[@]}"
   --output-json "${DINO_JSON}"
 )
@@ -72,6 +75,7 @@ dino_eval_cmd=(
 lora_one_cmd=(
   python -m qwen3_vl_det.eval_one_aux
   --checkpoint-dir "${LORA_DIR}/last"
+  --model-name "${MODEL_NAME}"
   --dataset-from-disk "${DATASET_FROM_DISK}"
   --split "${SPLIT_NAME}"
   --sample-index "${SAMPLE_INDEX}"
@@ -85,6 +89,7 @@ fi
 dino_one_cmd=(
   python -m qwen3_vl_det.eval_one_aux
   --checkpoint-dir "${DINO_DIR}/last"
+  --model-name "${MODEL_NAME}"
   --dataset-from-disk "${DATASET_FROM_DISK}"
   --split "${SPLIT_NAME}"
   --sample-index "${SAMPLE_INDEX}"

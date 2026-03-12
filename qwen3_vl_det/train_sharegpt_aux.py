@@ -564,6 +564,35 @@ def _extract_count_from_text(text: str) -> int | None:
     return None
 
 
+def _trim_generated_ids_by_prompt(
+    prompt_ids: torch.Tensor,
+    output_ids: torch.Tensor,
+    *,
+    max_shift_search: int = 8,
+) -> tuple[torch.Tensor, str]:
+    prompt = prompt_ids.detach().cpu()
+    output = output_ids.detach().cpu()
+    plen = int(prompt.shape[0])
+    olen = int(output.shape[0])
+    if olen == 0:
+        return output, "no_trim"
+    if olen >= plen and plen > 0 and torch.equal(output[:plen], prompt):
+        return output[plen:], "prefix_exact"
+    if plen > 0 and olen > plen:
+        max_shift = min(max_shift_search, olen - plen)
+        for shift in range(1, max_shift + 1):
+            if torch.equal(output[shift : shift + plen], prompt):
+                return output[shift + plen :], f"prefix_shift_{shift}"
+    if plen > 0:
+        common = 0
+        max_common = min(plen, olen)
+        while common < max_common and int(output[common].item()) == int(prompt[common].item()):
+            common += 1
+        if common >= max(4, min(32, plen // 4 if plen > 0 else 0)):
+            return output[common:], f"common_prefix_{common}"
+    return output, "no_prefix_match"
+
+
 def _first_token_positions(ids_1d: torch.Tensor, token_id: int) -> list[int]:
     if token_id < 0:
         return []
@@ -750,8 +779,7 @@ def _log_lm_preview(
     try:
         with torch.no_grad():
             gen_ids = model.generate_with_visual_injection(**gen_kwargs)
-        prompt_len = int(gen_kwargs["input_ids"].shape[1])
-        trimmed = gen_ids[0, prompt_len:] if gen_ids.shape[1] > prompt_len else gen_ids[0]
+        trimmed, trim_mode = _trim_generated_ids_by_prompt(gen_kwargs["input_ids"][0], gen_ids[0])
         pred_text = processor.tokenizer.decode(
             trimmed.detach().cpu().tolist(),
             skip_special_tokens=False,
@@ -767,6 +795,7 @@ def _log_lm_preview(
         print(
             f'lm_preview pred_count={pred_count if pred_count is not None else "n/a"} '
             f'gt_count={gt_count if gt_count is not None else "n/a"} '
+            f'trim={trim_mode} '
             f'text="{compact_text[:240]}"'
         )
     finally:

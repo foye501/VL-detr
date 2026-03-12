@@ -230,6 +230,35 @@ def _box_format_instruction(lm_box_output_mode: str, lm_box_output_order: str) -
     )
 
 
+def _trim_generated_ids_by_prompt(
+    prompt_ids: torch.Tensor,
+    output_ids: torch.Tensor,
+    *,
+    max_shift_search: int = 8,
+) -> torch.Tensor:
+    prompt = prompt_ids.detach().cpu()
+    output = output_ids.detach().cpu()
+    plen = int(prompt.shape[0])
+    olen = int(output.shape[0])
+    if olen == 0:
+        return output
+    if olen >= plen and plen > 0 and torch.equal(output[:plen], prompt):
+        return output[plen:]
+    if plen > 0 and olen > plen:
+        max_shift = min(max_shift_search, olen - plen)
+        for shift in range(1, max_shift + 1):
+            if torch.equal(output[shift : shift + plen], prompt):
+                return output[shift + plen :]
+    if plen > 0:
+        common = 0
+        max_common = min(plen, olen)
+        while common < max_common and int(output[common].item()) == int(prompt[common].item()):
+            common += 1
+        if common >= max(4, min(32, plen // 4 if plen > 0 else 0)):
+            return output[common:]
+    return output
+
+
 def cxcywh_to_xyxy_abs(boxes: torch.Tensor, width: int, height: int) -> torch.Tensor:
     if boxes.numel() == 0:
         return torch.zeros((0, 4), dtype=torch.float32)
@@ -557,7 +586,7 @@ def main() -> None:
             with torch.no_grad():
                 gen_ids = model.generate_with_visual_injection(**gen_kwargs)
             gen_trimmed = [
-                (out_ids[len(in_ids) :] if out_ids.shape[0] > in_ids.shape[0] else out_ids)
+                _trim_generated_ids_by_prompt(in_ids, out_ids)
                 for in_ids, out_ids in zip(inputs["input_ids"], gen_ids)
             ]
             lm_text = processor.batch_decode(

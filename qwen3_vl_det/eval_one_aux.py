@@ -201,6 +201,67 @@ def _derive_path(base_path: str, suffix: str) -> str:
     return f"{root}.{suffix}{ext}"
 
 
+def _trim_generated_ids_by_prompt(
+    prompt_ids: torch.Tensor,
+    output_ids: torch.Tensor,
+    *,
+    max_shift_search: int = 8,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    prompt = prompt_ids.detach().cpu()
+    output = output_ids.detach().cpu()
+    plen = int(prompt.shape[0])
+    olen = int(output.shape[0])
+    meta = {
+        "prompt_len": plen,
+        "output_len": olen,
+        "trimmed_len": olen,
+        "trim_mode": "no_trim",
+        "trim_offset": 0,
+    }
+    if olen == 0:
+        return output, meta
+    if olen >= plen and plen > 0 and torch.equal(output[:plen], prompt):
+        trimmed = output[plen:]
+        meta.update(
+            {
+                "trimmed_len": int(trimmed.shape[0]),
+                "trim_mode": "prefix_exact",
+                "trim_offset": plen,
+            }
+        )
+        return trimmed, meta
+    if plen > 0 and olen > plen:
+        max_shift = min(max_shift_search, olen - plen)
+        for shift in range(1, max_shift + 1):
+            if torch.equal(output[shift : shift + plen], prompt):
+                trimmed = output[shift + plen :]
+                meta.update(
+                    {
+                        "trimmed_len": int(trimmed.shape[0]),
+                        "trim_mode": f"prefix_shift_{shift}",
+                        "trim_offset": shift + plen,
+                    }
+                )
+                return trimmed, meta
+    if plen > 0:
+        common = 0
+        max_common = min(plen, olen)
+        while common < max_common and int(output[common].item()) == int(prompt[common].item()):
+            common += 1
+        if common >= max(4, min(32, plen // 4 if plen > 0 else 0)):
+            trimmed = output[common:]
+            meta.update(
+                {
+                    "trimmed_len": int(trimmed.shape[0]),
+                    "trim_mode": f"common_prefix_{common}",
+                    "trim_offset": common,
+                }
+            )
+            return trimmed, meta
+    meta["trim_mode"] = "no_prefix_match"
+    return output, meta
+
+
 def build_comparison_strip(
     gt_img: Image.Image,
     pred_img: Image.Image,
@@ -512,10 +573,12 @@ def main() -> None:
                 gen_ids = model.generate(**gen_kwargs)
             else:
                 gen_ids = model.generate_with_visual_injection(**gen_kwargs)
-        gen_trimmed = [
-            (out_ids[len(in_ids) :] if out_ids.shape[0] > in_ids.shape[0] else out_ids)
-            for in_ids, out_ids in zip(inputs["input_ids"], gen_ids)
-        ]
+        trim_meta = []
+        gen_trimmed = []
+        for in_ids, out_ids in zip(inputs["input_ids"], gen_ids):
+            trimmed_ids, meta = _trim_generated_ids_by_prompt(in_ids, out_ids)
+            gen_trimmed.append(trimmed_ids)
+            trim_meta.append(meta)
         lm_generated_text = processor.batch_decode(
             gen_trimmed,
             skip_special_tokens=True,
@@ -711,6 +774,7 @@ def main() -> None:
             "max_new_tokens": int(args.lm_max_new_tokens),
             "box_parse_mode_used": effective_lm_parse_mode,
             "box_parse_order_used": effective_lm_parse_order,
+            "trim": (trim_meta[0] if args.eval_lm_generation and trim_meta else None),
             "text": lm_generated_text,
         },
         "settings": {
@@ -798,6 +862,8 @@ def main() -> None:
     if "lm_loss" in out:
         print(f"LM loss (for this sample prompt): {float(out['lm_loss'].detach().cpu()):.4f}")
     if args.eval_lm_generation:
+        if trim_meta:
+            print("LM generation trim:", trim_meta[0])
         if lm_raw_boxes:
             print("LM raw boxes (text order):")
             for i, raw in enumerate(lm_raw_boxes[:20]):

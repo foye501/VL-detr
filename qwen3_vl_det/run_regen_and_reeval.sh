@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-DATA_OUTPUT_DIR="${DATA_OUTPUT_DIR:-qwen3_vl_det/data_synth_regen}"
-SPLIT_NAME="${SPLIT_NAME:-train}"
-SAMPLES_PER_LEVEL="${SAMPLES_PER_LEVEL:-2500}"
+DATA_OUTPUT_DIR="${DATA_OUTPUT_DIR:-qwen3_vl_det/data_synth_regen_eval50}"
+SPLIT_NAME="${SPLIT_NAME:-eval}"
+SAMPLES_PER_LEVEL="${SAMPLES_PER_LEVEL:-50}"
 IMAGE_SIZE="${IMAGE_SIZE:-512}"
 SEED="${SEED:-17}"
 EXPORT_IMAGES="${EXPORT_IMAGES:-1}"
@@ -11,16 +11,16 @@ EXPORT_IMAGES="${EXPORT_IMAGES:-1}"
 LORA_DIR="${LORA_DIR:-qwen3_vl_det/checkpoints_lora_boxcount_baseline_v2}"
 DINO_DIR="${DINO_DIR:-qwen3_vl_det/checkpoints_dino_fused_visual_boxcount_v2_t64}"
 
-START_INDEX="${START_INDEX:-3000}"
-MAX_SAMPLES="${MAX_SAMPLES:-1000}"
+START_INDEX="${START_INDEX:-0}"
+MAX_SAMPLES="${MAX_SAMPLES:-200}"
 NUM_QUERIES="${NUM_QUERIES:-100}"
 OBJ_THRESHOLD="${OBJ_THRESHOLD:-0.15}"
 IOU_THRESHOLD="${IOU_THRESHOLD:-0.5}"
 LM_MAX_NEW_TOKENS="${LM_MAX_NEW_TOKENS:-2048}"
 REQUIRE_VISION="${REQUIRE_VISION:-1}"
 
-SAMPLE_INDEX="${SAMPLE_INDEX:-5113}"
-ANALYSIS_DIR="${ANALYSIS_DIR:-qwen3_vl_det/analysis_regen_lora_vs_dino}"
+SAMPLE_INDEX="${SAMPLE_INDEX:-73}"
+ANALYSIS_DIR="${ANALYSIS_DIR:-qwen3_vl_det/analysis_regen_eval50_lora_vs_dino}"
 
 DATASET_FROM_DISK="${DATASET_FROM_DISK:-${DATA_OUTPUT_DIR}/${SPLIT_NAME}}"
 LORA_JSON="${LORA_JSON:-${LORA_DIR}/eval_regen_split.json}"

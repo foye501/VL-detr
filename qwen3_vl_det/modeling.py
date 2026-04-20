@@ -1143,6 +1143,7 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
         except Exception as exc:
             fused_inputs.pop("pixel_values", None)
             fused_inputs.pop("image_grid_thw", None)
+            fused_inputs.pop("mm_token_type_ids", None)
             if not self._warned_lm_fusion_fail:
                 print(
                     "WARNING: visual-token LM fusion with pixel inputs failed; "
@@ -1416,6 +1417,7 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         pixel_values: Optional[torch.Tensor] = None,
         image_grid_thw: Optional[torch.Tensor] = None,
+        mm_token_type_ids: Optional[torch.Tensor] = None,
         dino_pixel_values: Optional[torch.Tensor] = None,
         **generate_kwargs: Any,
     ) -> torch.Tensor:
@@ -1433,6 +1435,8 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
                 gen_inputs["pixel_values"] = pixel_values
             if image_grid_thw is not None:
                 gen_inputs["image_grid_thw"] = image_grid_thw
+            if mm_token_type_ids is not None:
+                gen_inputs["mm_token_type_ids"] = mm_token_type_ids
             return self.base_model.generate(**gen_inputs, **generate_kwargs)
 
         if (
@@ -1453,6 +1457,8 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
                     gen_inputs["pixel_values"] = pixel_values
                 if image_grid_thw is not None:
                     gen_inputs["image_grid_thw"] = image_grid_thw
+                if mm_token_type_ids is not None:
+                    gen_inputs["mm_token_type_ids"] = mm_token_type_ids
                 try:
                     return self.base_model.generate(**gen_inputs, **generate_kwargs)
                 except Exception as exc:
@@ -1464,6 +1470,7 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
                         self._warned_lm_fusion_fail = True
                     gen_inputs.pop("pixel_values", None)
                     gen_inputs.pop("image_grid_thw", None)
+                    gen_inputs.pop("mm_token_type_ids", None)
                     return self.base_model.generate(**gen_inputs, **generate_kwargs)
 
         if (
@@ -1476,6 +1483,7 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
                 attention_mask=attention_mask,
                 pixel_values=pixel_values,
                 image_grid_thw=image_grid_thw,
+                mm_token_type_ids=mm_token_type_ids,
                 output_hidden_states=True,
                 return_dict=True,
             )
@@ -1496,6 +1504,8 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
                     gen_inputs["pixel_values"] = pixel_values
                 if image_grid_thw is not None:
                     gen_inputs["image_grid_thw"] = image_grid_thw
+                if mm_token_type_ids is not None:
+                    gen_inputs["mm_token_type_ids"] = mm_token_type_ids
                 try:
                     return self.base_model.generate(**gen_inputs, **generate_kwargs)
                 except Exception as exc:
@@ -1507,6 +1517,7 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
                         self._warned_lm_fusion_fail = True
                     gen_inputs.pop("pixel_values", None)
                     gen_inputs.pop("image_grid_thw", None)
+                    gen_inputs.pop("mm_token_type_ids", None)
                     return self.base_model.generate(**gen_inputs, **generate_kwargs)
 
         outputs = self.base_model(
@@ -1514,6 +1525,7 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
             attention_mask=attention_mask,
             pixel_values=pixel_values,
             image_grid_thw=image_grid_thw,
+            mm_token_type_ids=mm_token_type_ids,
             output_hidden_states=True,
             return_dict=True,
         )
@@ -1564,6 +1576,8 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
                 gen_inputs["pixel_values"] = pixel_values
             if image_grid_thw is not None:
                 gen_inputs["image_grid_thw"] = image_grid_thw
+            if mm_token_type_ids is not None:
+                gen_inputs["mm_token_type_ids"] = mm_token_type_ids
             return self.base_model.generate(**gen_inputs, **generate_kwargs)
 
         gen_inputs = {"inputs_embeds": inputs_embeds}
@@ -1573,6 +1587,8 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
             gen_inputs["pixel_values"] = pixel_values
         if image_grid_thw is not None:
             gen_inputs["image_grid_thw"] = image_grid_thw
+        if mm_token_type_ids is not None:
+            gen_inputs["mm_token_type_ids"] = mm_token_type_ids
         try:
             return self.base_model.generate(**gen_inputs, **generate_kwargs)
         except Exception as exc:
@@ -1584,6 +1600,7 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
                 self._warned_lm_fusion_fail = True
             gen_inputs.pop("pixel_values", None)
             gen_inputs.pop("image_grid_thw", None)
+            gen_inputs.pop("mm_token_type_ids", None)
             return self.base_model.generate(**gen_inputs, **generate_kwargs)
 
     @torch.no_grad()
@@ -1593,6 +1610,7 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         pixel_values: Optional[torch.Tensor] = None,
         image_grid_thw: Optional[torch.Tensor] = None,
+        mm_token_type_ids: Optional[torch.Tensor] = None,
         dino_pixel_values: Optional[torch.Tensor] = None,
         **generate_kwargs: Any,
     ) -> torch.Tensor:
@@ -1601,6 +1619,7 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
             attention_mask=attention_mask,
             pixel_values=pixel_values,
             image_grid_thw=image_grid_thw,
+            mm_token_type_ids=mm_token_type_ids,
             dino_pixel_values=dino_pixel_values,
             **generate_kwargs,
         )

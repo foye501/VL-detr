@@ -658,7 +658,7 @@ def _dump_first_batch_debug(
             "max_new_tokens": int(args.debug_first_batch_max_new_tokens),
             "do_sample": False,
         }
-        for k in ("attention_mask", "pixel_values", "image_grid_thw", "dino_pixel_values"):
+        for k in ("attention_mask", "pixel_values", "image_grid_thw", "mm_token_type_ids", "dino_pixel_values"):
             if k in batch_dev and torch.is_tensor(batch_dev[k]):
                 gen_kwargs[k] = batch_dev[k][:1]
         was_training = model.training
@@ -784,7 +784,7 @@ def _log_lm_preview(
     }
     if "dino_pixel_values" in batch_dev and torch.is_tensor(batch_dev["dino_pixel_values"]):
         prompt_inputs["dino_pixel_values"] = batch_dev["dino_pixel_values"][:1]
-    for k in ("pixel_values", "image_grid_thw"):
+    for k in ("pixel_values", "image_grid_thw", "mm_token_type_ids"):
         if k not in prompt_inputs and k in batch_dev and torch.is_tensor(batch_dev[k]):
             prompt_inputs[k] = batch_dev[k][:1]
 
@@ -795,7 +795,7 @@ def _log_lm_preview(
     }
     if "attention_mask" in prompt_inputs and torch.is_tensor(prompt_inputs["attention_mask"]):
         gen_kwargs["attention_mask"] = prompt_inputs["attention_mask"]
-    for k in ("pixel_values", "image_grid_thw", "dino_pixel_values"):
+    for k in ("pixel_values", "image_grid_thw", "mm_token_type_ids", "dino_pixel_values"):
         if k in prompt_inputs and torch.is_tensor(prompt_inputs[k]):
             gen_kwargs[k] = prompt_inputs[k]
 
@@ -1279,7 +1279,7 @@ def main() -> None:
                     or args.inject_instance_tokens_to_lm
                 ),
             }
-            for k in ("attention_mask", "pixel_values", "image_grid_thw", "dino_pixel_values"):
+            for k in ("attention_mask", "pixel_values", "image_grid_thw", "mm_token_type_ids", "dino_pixel_values"):
                 if k in batch and batch[k] is not None:
                     model_inputs[k] = batch[k]
 

@@ -561,6 +561,7 @@ def main() -> None:
                 attention_mask=inputs.get("attention_mask"),
                 pixel_values=inputs.get("pixel_values"),
                 image_grid_thw=inputs.get("image_grid_thw"),
+                mm_token_type_ids=inputs.get("mm_token_type_ids"),
                 dino_pixel_values=inputs.get("dino_pixel_values"),
                 det_enabled=True,
                 return_det=True,
@@ -584,6 +585,8 @@ def main() -> None:
             gen_kwargs["pixel_values"] = inputs.get("pixel_values")
         if "image_grid_thw" in inputs:
             gen_kwargs["image_grid_thw"] = inputs.get("image_grid_thw")
+        if "mm_token_type_ids" in inputs:
+            gen_kwargs["mm_token_type_ids"] = inputs.get("mm_token_type_ids")
         if "dino_pixel_values" in inputs:
             gen_kwargs["dino_pixel_values"] = inputs.get("dino_pixel_values")
         with torch.no_grad():

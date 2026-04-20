@@ -63,6 +63,10 @@ class AuxDetrBranchConfig:
     inject_det_queries_to_lm: bool = False
     det_query_token_id: Optional[int] = None
     detach_det_queries_for_lm: bool = False
+    inject_instance_tokens_to_lm: bool = False
+    instance_token_id: Optional[int] = None
+    instance_lm_num_tokens: int = 32
+    detach_instance_tokens_for_lm: bool = False
     inject_dino_tokens_to_lm: bool = False
     dino_lm_token_id: Optional[int] = None
     dino_lm_num_tokens: int = 16
@@ -1001,6 +1005,44 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
             detach_features=bool(self.branch_cfg.detach_det_queries_for_lm),
         )
 
+    def _select_instance_tokens_for_lm(
+        self,
+        query_states: torch.Tensor,
+        obj_logits: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        if query_states.dim() != 3 or obj_logits.dim() != 2:
+            return None
+        if query_states.shape[:2] != obj_logits.shape:
+            return None
+        num_tokens = max(1, int(self.branch_cfg.instance_lm_num_tokens))
+        num_tokens = min(num_tokens, int(query_states.shape[1]))
+        if num_tokens <= 0:
+            return None
+        if num_tokens >= int(query_states.shape[1]):
+            return query_states
+        topk_idx = torch.topk(obj_logits, k=num_tokens, dim=1).indices
+        gather_idx = topk_idx.unsqueeze(-1).expand(-1, -1, int(query_states.shape[-1]))
+        return query_states.gather(dim=1, index=gather_idx)
+
+    def _inject_instance_tokens_into_inputs_embeds(
+        self,
+        input_ids: Optional[torch.Tensor],
+        query_states: torch.Tensor,
+        obj_logits: torch.Tensor,
+    ) -> tuple[Optional[torch.Tensor], int]:
+        instance_states = self._select_instance_tokens_for_lm(
+            query_states=query_states,
+            obj_logits=obj_logits,
+        )
+        if instance_states is None:
+            return None, 0
+        return self._inject_token_features_into_inputs_embeds(
+            input_ids=input_ids,
+            token_states=instance_states,
+            token_id=self.branch_cfg.instance_token_id,
+            detach_features=bool(self.branch_cfg.detach_instance_tokens_for_lm),
+        )
+
     def _inject_dino_tokens_into_inputs_embeds(
         self,
         input_ids: Optional[torch.Tensor],
@@ -1126,16 +1168,30 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
         """
         first_inputs = dict(base_inputs)
         dino_pixel_values = first_inputs.pop("dino_pixel_values", None)
-        need_det = det_enabled and (gt_boxes is not None or return_det)
         use_det_lm_fusion = bool(self.branch_cfg.inject_det_queries_to_lm)
-        use_dino_lm_fusion = bool(self.branch_cfg.inject_dino_tokens_to_lm) and not use_det_lm_fusion
+        use_instance_lm_fusion = (
+            bool(self.branch_cfg.inject_instance_tokens_to_lm)
+            and not use_det_lm_fusion
+        )
+        use_dino_lm_fusion = (
+            bool(self.branch_cfg.inject_dino_tokens_to_lm)
+            and not use_det_lm_fusion
+            and not use_instance_lm_fusion
+        )
         use_fused_visual_lm_fusion = (
             bool(self.branch_cfg.inject_fused_visual_tokens_to_lm)
             and not use_det_lm_fusion
+            and not use_instance_lm_fusion
             and not use_dino_lm_fusion
         )
+        need_det = (det_enabled or use_det_lm_fusion or use_instance_lm_fusion) and (
+            gt_boxes is not None
+            or return_det
+            or use_det_lm_fusion
+            or use_instance_lm_fusion
+        )
         need_visual_memory = bool(need_det or use_fused_visual_lm_fusion)
-        if use_det_lm_fusion:
+        if use_det_lm_fusion or use_instance_lm_fusion:
             # LM loss will be computed from a fused second pass after DET query injection.
             first_inputs.pop("labels", None)
         if use_fused_visual_lm_fusion:
@@ -1179,6 +1235,7 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
 
         det_loss = None
         query_states = None
+        obj_logits = None
         if need_det:
             input_ids = base_inputs.get("input_ids")
             if input_ids is None:
@@ -1267,6 +1324,44 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
                         self._warned_lm_fusion_fail = True
 
         if (
+            use_instance_lm_fusion
+            and query_states is not None
+            and obj_logits is not None
+            and ("labels" in base_inputs)
+            and (base_inputs.get("labels") is not None)
+        ):
+            input_ids = base_inputs.get("input_ids")
+            inputs_embeds, injected = self._inject_instance_tokens_into_inputs_embeds(
+                input_ids=input_ids,
+                query_states=query_states,
+                obj_logits=obj_logits,
+            )
+            result["lm_instance_token_injected"] = bool(injected > 0)
+            result["lm_instance_token_injected_count"] = int(injected)
+            if inputs_embeds is not None:
+                try:
+                    fused_outputs = self._run_base_with_inputs_embeds(
+                        base_inputs={
+                            k: v
+                            for k, v in base_inputs.items()
+                            if k != "dino_pixel_values"
+                        },
+                        inputs_embeds=inputs_embeds,
+                        output_hidden_states=False,
+                    )
+                    lm_loss = getattr(fused_outputs, "loss", lm_loss)
+                    if lm_loss is not None:
+                        result["lm_loss"] = lm_loss
+                    del fused_outputs
+                except Exception as exc:
+                    if not self._warned_lm_fusion_fail:
+                        print(
+                            "WARNING: instance-token-to-LM fusion second pass failed; "
+                            f"falling back to base LM path. error={type(exc).__name__}: {exc}"
+                        )
+                        self._warned_lm_fusion_fail = True
+
+        if (
             use_det_lm_fusion
             and query_states is not None
             and ("labels" in base_inputs)
@@ -1327,6 +1422,7 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
         """Generate text using configured visual-token injection into LM prompt embeddings."""
         if (
             not self.branch_cfg.inject_det_queries_to_lm
+            and not self.branch_cfg.inject_instance_tokens_to_lm
             and not self.branch_cfg.inject_dino_tokens_to_lm
             and not self.branch_cfg.inject_fused_visual_tokens_to_lm
         ):
@@ -1342,6 +1438,7 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
         if (
             self.branch_cfg.inject_dino_tokens_to_lm
             and not self.branch_cfg.inject_det_queries_to_lm
+            and not self.branch_cfg.inject_instance_tokens_to_lm
             and not self.branch_cfg.inject_fused_visual_tokens_to_lm
         ):
             inputs_embeds, injected = self._inject_dino_tokens_into_inputs_embeds(
@@ -1372,6 +1469,7 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
         if (
             self.branch_cfg.inject_fused_visual_tokens_to_lm
             and not self.branch_cfg.inject_det_queries_to_lm
+            and not self.branch_cfg.inject_instance_tokens_to_lm
         ):
             outputs = self.base_model(
                 input_ids=input_ids,
@@ -1444,10 +1542,20 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
             dino_pixel_values=dino_pixel_values,
         )
         query_states = self._decode_queries(memory=memory, memory_mask=memory_mask)
-        inputs_embeds, injected = self._inject_det_queries_into_inputs_embeds(
-            input_ids=input_ids,
-            query_states=query_states,
-        )
+        obj_logits = self.obj_head(query_states).squeeze(-1)
+        if bool(self.branch_cfg.inject_instance_tokens_to_lm):
+            inputs_embeds, injected = self._inject_instance_tokens_into_inputs_embeds(
+                input_ids=input_ids,
+                query_states=query_states,
+                obj_logits=obj_logits,
+            )
+            warn_label = "instance-token"
+        else:
+            inputs_embeds, injected = self._inject_det_queries_into_inputs_embeds(
+                input_ids=input_ids,
+                query_states=query_states,
+            )
+            warn_label = "DETR-query"
         if inputs_embeds is None or injected <= 0:
             gen_inputs = {"input_ids": input_ids}
             if attention_mask is not None:
@@ -1470,7 +1578,7 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
         except Exception as exc:
             if not self._warned_lm_fusion_fail:
                 print(
-                    "WARNING: DETR-query generate with pixel inputs failed; "
+                    f"WARNING: {warn_label} generate with pixel inputs failed; "
                     f"retrying without pixel tensors. error={type(exc).__name__}: {exc}"
                 )
                 self._warned_lm_fusion_fail = True

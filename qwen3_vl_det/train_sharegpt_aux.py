@@ -28,6 +28,7 @@ from qwen3_vl_det.train_sharegpt import (
     BOX_SUPERVISION_CHOICES,
     DET_QUERY_TOKEN,
     DINO_PATCH_TOKEN,
+    INSTANCE_QUERY_TOKEN,
     _extract_image,
     cxcywh_norm_to_xyxy_abs,
     extract_gt_boxes_from_example,
@@ -106,6 +107,9 @@ class TrainAuxArgs:
     detach_dino_tokens_for_lm: bool = False
     inject_fused_visual_tokens_to_lm: bool = False
     detach_fused_visual_tokens_for_lm: bool = False
+    inject_instance_tokens_to_lm: bool = False
+    instance_lm_num_tokens: int = 32
+    detach_instance_tokens_for_lm: bool = False
     use_dino_fusion: bool = False
     dino_model_name: str = "facebook/dinov2-base"
     dino_trainable: bool = False
@@ -226,6 +230,9 @@ def parse_args() -> TrainAuxArgs:
     p.add_argument("--detach-dino-tokens-for-lm", action="store_true")
     p.add_argument("--inject-fused-visual-tokens-to-lm", action="store_true")
     p.add_argument("--detach-fused-visual-tokens-for-lm", action="store_true")
+    p.add_argument("--inject-instance-tokens-to-lm", action="store_true")
+    p.add_argument("--instance-lm-num-tokens", type=int, default=TrainAuxArgs.instance_lm_num_tokens)
+    p.add_argument("--detach-instance-tokens-for-lm", action="store_true")
     p.add_argument("--use-dino-fusion", action="store_true")
     p.add_argument("--dino-model-name", default=TrainAuxArgs.dino_model_name)
     p.add_argument("--dino-trainable", action="store_true")
@@ -280,7 +287,9 @@ class ShareGptAuxCollator:
         inject_det_queries_to_lm: bool,
         inject_dino_tokens_to_lm: bool,
         inject_fused_visual_tokens_to_lm: bool,
+        inject_instance_tokens_to_lm: bool,
         num_queries: int,
+        instance_lm_num_tokens: int,
         assistant_only_loss: bool,
     ) -> None:
         self.processor = processor
@@ -301,10 +310,13 @@ class ShareGptAuxCollator:
         self.inject_det_queries_to_lm = bool(inject_det_queries_to_lm)
         self.inject_dino_tokens_to_lm = bool(inject_dino_tokens_to_lm)
         self.inject_fused_visual_tokens_to_lm = bool(inject_fused_visual_tokens_to_lm)
+        self.inject_instance_tokens_to_lm = bool(inject_instance_tokens_to_lm)
         self.num_queries = int(num_queries)
+        self.instance_lm_num_tokens = int(instance_lm_num_tokens)
         self.assistant_only_loss = assistant_only_loss
         self.query_token_id = -1
         self.dino_token_id = -1
+        self.instance_token_id = -1
         if self.inject_det_queries_to_lm:
             vocab = self.processor.tokenizer.get_vocab()
             if DET_QUERY_TOKEN not in vocab:
@@ -315,6 +327,14 @@ class ShareGptAuxCollator:
             self.query_token_id = int(self.processor.tokenizer.convert_tokens_to_ids(DET_QUERY_TOKEN))
         if DINO_PATCH_TOKEN in self.processor.tokenizer.get_vocab():
             self.dino_token_id = int(self.processor.tokenizer.convert_tokens_to_ids(DINO_PATCH_TOKEN))
+        if self.inject_instance_tokens_to_lm:
+            vocab = self.processor.tokenizer.get_vocab()
+            if INSTANCE_QUERY_TOKEN not in vocab:
+                raise ValueError(
+                    f"{INSTANCE_QUERY_TOKEN} is missing in tokenizer vocab while "
+                    "--inject-instance-tokens-to-lm is enabled."
+                )
+            self.instance_token_id = int(self.processor.tokenizer.convert_tokens_to_ids(INSTANCE_QUERY_TOKEN))
 
     def _format_box_for_lm(self, xyxy_abs: list[float], width: int, height: int) -> list[float | int]:
         x1, y1, x2, y2 = [float(v) for v in xyxy_abs]
@@ -420,6 +440,9 @@ class ShareGptAuxCollator:
             if (self.inject_dino_tokens_to_lm or self.inject_fused_visual_tokens_to_lm) and self.dino_token_id >= 0:
                 dino_text = " ".join([DINO_PATCH_TOKEN] * max(self.num_queries, 1))
                 user_text = f"{user_text}\n{dino_text}"
+            if self.inject_instance_tokens_to_lm and self.instance_token_id >= 0:
+                instance_text = " ".join([INSTANCE_QUERY_TOKEN] * max(self.instance_lm_num_tokens, 1))
+                user_text = f"{user_text}\n{instance_text}"
             if self.lm_append_box_instruction and lm_mode_used == "box_count":
                 user_text = f"{user_text}\n{self._box_format_instruction()}"
             user_texts.append(user_text)
@@ -489,6 +512,8 @@ class ShareGptAuxCollator:
             labels[inputs["input_ids"] == self.query_token_id] = -100
         if (self.inject_dino_tokens_to_lm or self.inject_fused_visual_tokens_to_lm) and self.dino_token_id >= 0:
             labels[inputs["input_ids"] == self.dino_token_id] = -100
+        if self.inject_instance_tokens_to_lm and self.instance_token_id >= 0:
+            labels[inputs["input_ids"] == self.instance_token_id] = -100
         if self.assistant_only_loss:
             if self.use_vision:
                 prompt_inputs = self.processor(
@@ -809,11 +834,16 @@ def main() -> None:
         int(bool(args.inject_det_queries_to_lm))
         + int(bool(args.inject_dino_tokens_to_lm))
         + int(bool(args.inject_fused_visual_tokens_to_lm))
+        + int(bool(args.inject_instance_tokens_to_lm))
     )
     if lm_injection_modes > 1:
-        raise ValueError("Choose only one LM fusion path: DET queries, direct DINO tokens, or fused visual tokens.")
+        raise ValueError(
+            "Choose only one LM fusion path: DET queries, direct DINO tokens, fused visual tokens, or instance tokens."
+        )
     if (args.inject_dino_tokens_to_lm or args.inject_fused_visual_tokens_to_lm) and not args.use_dino_fusion:
         raise ValueError("DINO/fused LM token injection requires --use-dino-fusion.")
+    if args.inject_instance_tokens_to_lm and args.det_weight <= 0.0:
+        raise ValueError("Instance-token LM injection requires --det-weight > 0.")
     os.makedirs(args.output_dir, exist_ok=True)
     torch.manual_seed(args.seed)
     random.seed(args.seed)
@@ -862,6 +892,8 @@ def main() -> None:
     added_det_query_tokens = 0
     dino_lm_token_id = None
     added_dino_patch_tokens = 0
+    instance_lm_token_id = None
+    added_instance_tokens = 0
     if args.inject_det_queries_to_lm:
         proc_tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else tokenizer
         vocab = proc_tokenizer.get_vocab()
@@ -893,6 +925,22 @@ def main() -> None:
             f"id={dino_lm_token_id} added={added_dino_patch_tokens} "
             f"num_tokens={args.dino_lm_num_tokens}"
         )
+    if args.inject_instance_tokens_to_lm:
+        proc_tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else tokenizer
+        vocab = proc_tokenizer.get_vocab()
+        if INSTANCE_QUERY_TOKEN not in vocab:
+            added_instance_tokens = int(
+                proc_tokenizer.add_special_tokens({"additional_special_tokens": [INSTANCE_QUERY_TOKEN]})
+            )
+        instance_lm_token_id = int(proc_tokenizer.convert_tokens_to_ids(INSTANCE_QUERY_TOKEN))
+        tokenizer = proc_tokenizer
+        if hasattr(processor, "tokenizer"):
+            processor.tokenizer = proc_tokenizer
+        print(
+            f"Instance-token LM injection enabled: token={INSTANCE_QUERY_TOKEN} "
+            f"id={instance_lm_token_id} added={added_instance_tokens} "
+            f"num_tokens={args.instance_lm_num_tokens}"
+        )
 
     image_token_id = args.image_token_id if args.image_token_id >= 0 else None
     branch_cfg = AuxDetrBranchConfig(
@@ -907,6 +955,10 @@ def main() -> None:
         detach_dino_tokens_for_lm=bool(args.detach_dino_tokens_for_lm),
         inject_fused_visual_tokens_to_lm=bool(args.inject_fused_visual_tokens_to_lm),
         detach_fused_visual_tokens_for_lm=bool(args.detach_fused_visual_tokens_for_lm),
+        inject_instance_tokens_to_lm=bool(args.inject_instance_tokens_to_lm),
+        instance_token_id=instance_lm_token_id,
+        instance_lm_num_tokens=int(args.instance_lm_num_tokens),
+        detach_instance_tokens_for_lm=bool(args.detach_instance_tokens_for_lm),
         use_dino_fusion=bool(args.use_dino_fusion),
         dino_model_name=str(args.dino_model_name),
         dino_trainable=bool(args.dino_trainable),
@@ -1106,8 +1158,10 @@ def main() -> None:
         lm_count_first=args.lm_count_first,
         lm_append_box_instruction=args.lm_append_box_instruction,
         inject_det_queries_to_lm=args.inject_det_queries_to_lm,
+        inject_instance_tokens_to_lm=args.inject_instance_tokens_to_lm,
         inject_dino_tokens_to_lm=args.inject_dino_tokens_to_lm,
         inject_fused_visual_tokens_to_lm=args.inject_fused_visual_tokens_to_lm,
+        instance_lm_num_tokens=args.instance_lm_num_tokens,
         num_queries=(args.dino_lm_num_tokens if (args.inject_dino_tokens_to_lm or args.inject_fused_visual_tokens_to_lm) else args.num_queries),
         assistant_only_loss=args.assistant_only_loss,
     )
@@ -1214,8 +1268,16 @@ def main() -> None:
                 "input_ids": batch["input_ids"],
                 "labels": batch["labels"],
                 "gt_boxes": batch["gt_boxes"],
-                "det_enabled": bool(args.det_weight > 0.0 or args.inject_det_queries_to_lm),
-                "return_det": bool(args.det_weight > 0.0 or args.inject_det_queries_to_lm),
+                "det_enabled": bool(
+                    args.det_weight > 0.0
+                    or args.inject_det_queries_to_lm
+                    or args.inject_instance_tokens_to_lm
+                ),
+                "return_det": bool(
+                    args.det_weight > 0.0
+                    or args.inject_det_queries_to_lm
+                    or args.inject_instance_tokens_to_lm
+                ),
             }
             for k in ("attention_mask", "pixel_values", "image_grid_thw", "dino_pixel_values"):
                 if k in batch and batch[k] is not None:

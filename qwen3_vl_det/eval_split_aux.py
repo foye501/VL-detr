@@ -27,6 +27,7 @@ from qwen3_vl_det.train_sharegpt import (
     BOX_SUPERVISION_CHOICES,
     DET_QUERY_TOKEN,
     DINO_PATCH_TOKEN,
+    INSTANCE_QUERY_TOKEN,
     _extract_image,
     extract_gt_boxes_from_example,
     extract_user_assistant_from_example,
@@ -322,7 +323,11 @@ def _checkpoint_uses_detr(train_args: dict[str, Any], branch_cfg: AuxDetrBranchC
         det_weight = float(train_args.get("det_weight", 0.0))
     except Exception:
         det_weight = 0.0
-    return det_weight > 0.0 or bool(getattr(branch_cfg, "inject_det_queries_to_lm", False))
+    return (
+        det_weight > 0.0
+        or bool(getattr(branch_cfg, "inject_det_queries_to_lm", False))
+        or bool(getattr(branch_cfg, "inject_instance_tokens_to_lm", False))
+    )
 
 
 def build_model_and_processor(args: argparse.Namespace):
@@ -379,6 +384,12 @@ def build_model_and_processor(args: argparse.Namespace):
         print(
             "LM fusion mode: enabled "
             f"(det_query_token_id={getattr(branch_cfg, 'det_query_token_id', None)})"
+        )
+    if bool(getattr(branch_cfg, "inject_instance_tokens_to_lm", False)):
+        print(
+            "LM fusion mode: instance tokens "
+            f"(instance_token_id={getattr(branch_cfg, 'instance_token_id', None)}, "
+            f"num_tokens={getattr(branch_cfg, 'instance_lm_num_tokens', None)})"
         )
     if bool(getattr(branch_cfg, "inject_dino_tokens_to_lm", False)):
         print(
@@ -474,6 +485,13 @@ def main() -> None:
         ):
             query_text = " ".join([DET_QUERY_TOKEN] * max(int(args.num_queries), 1))
             user_text = f"{user_text}\n{query_text}"
+        if bool(getattr(model.branch_cfg, "inject_instance_tokens_to_lm", False)) and (
+            getattr(model.branch_cfg, "instance_token_id", None) is not None
+        ):
+            instance_text = " ".join(
+                [INSTANCE_QUERY_TOKEN] * max(int(getattr(model.branch_cfg, "instance_lm_num_tokens", 32)), 1)
+            )
+            user_text = f"{user_text}\n{instance_text}"
         if (
             bool(getattr(model.branch_cfg, "inject_dino_tokens_to_lm", False))
             or bool(getattr(model.branch_cfg, "inject_fused_visual_tokens_to_lm", False))

@@ -41,6 +41,8 @@ from qwen3_vl_det.train_sharegpt import (
 class EvalRow:
     index: int
     gt_count: int
+    gt_count_detr: int
+    gt_count_lm: int
     pred_count_detr: int | None
     pred_count_soft_detr: float | None
     abs_error_detr: int | None
@@ -74,6 +76,12 @@ def parse_args() -> argparse.Namespace:
         "--box-supervision-source",
         choices=list(BOX_SUPERVISION_CHOICES),
         default="all",
+    )
+    p.add_argument(
+        "--lm-box-supervision-source",
+        choices=["auto"] + list(BOX_SUPERVISION_CHOICES),
+        default="auto",
+        help="GT source for LM text/box metrics. auto uses checkpoint lm_box_source when available.",
     )
     p.add_argument("--easy-max", type=int, default=5)
     p.add_argument("--medium-max", type=int, default=20)
@@ -132,7 +140,7 @@ def aggregate_det_metrics(rows: list[EvalRow], det_active: bool) -> dict[str, fl
             "f1": 0.0,
         }
     count_mae = sum(int(r.abs_error_detr) for r in valid) / len(valid)
-    count_soft_mae = sum(abs(float(r.pred_count_soft_detr) - r.gt_count) for r in valid) / len(valid)
+    count_soft_mae = sum(abs(float(r.pred_count_soft_detr) - r.gt_count_detr) for r in valid) / len(valid)
     count_acc = sum(1.0 for r in valid if r.abs_error_detr == 0) / len(valid)
     precision = sum(float(r.precision_detr) for r in valid) / len(valid)
     recall = sum(float(r.recall_detr) for r in valid) / len(valid)
@@ -440,6 +448,7 @@ def main() -> None:
     ckpt_mode = str(train_args.get("box_coord_mode", "")).lower()
     ckpt_order = str(train_args.get("box_coord_order", "")).lower()
     ckpt_source = str(train_args.get("box_supervision_source", "")).lower()
+    ckpt_lm_source = str(train_args.get("lm_box_source", "")).lower()
     ckpt_lm_mode = str(train_args.get("lm_box_output_mode", "")).lower()
     ckpt_lm_order = str(train_args.get("lm_box_output_order", "")).lower()
     ckpt_lm_target_mode = str(train_args.get("lm_target_mode", "")).lower()
@@ -454,6 +463,9 @@ def main() -> None:
     if args.box_supervision_source == "all" and ckpt_source in BOX_SUPERVISION_CHOICES:
         # Mirror train-time default unless user explicitly overrides.
         effective_source = ckpt_source
+    effective_lm_source = args.lm_box_supervision_source
+    if effective_lm_source == "auto":
+        effective_lm_source = ckpt_lm_source if ckpt_lm_source in BOX_SUPERVISION_CHOICES else effective_source
     effective_lm_parse_mode = args.lm_box_parse_mode
     effective_lm_parse_order = args.lm_box_parse_order
     if effective_lm_parse_mode == "auto" and ckpt_lm_mode in ("absolute", "norm1000", "norm01"):
@@ -464,6 +476,10 @@ def main() -> None:
         f"Eval coord mode/order/source: requested=({args.box_coord_mode},{args.box_coord_order},{args.box_supervision_source}) "
         f"checkpoint=({ckpt_mode or 'n/a'},{ckpt_order or 'n/a'},{ckpt_source or 'n/a'}) "
         f"used=({effective_mode},{effective_order},{effective_source})"
+    )
+    print(
+        f"Eval LM GT source: requested={args.lm_box_supervision_source} "
+        f"checkpoint_lm={ckpt_lm_source or 'n/a'} used={effective_lm_source}"
     )
     print(
         f"Eval LM-box parse mode/order: requested=({args.lm_box_parse_mode},{args.lm_box_parse_order}) "
@@ -565,7 +581,7 @@ def main() -> None:
             pred_xyxy = torch.zeros((0, 4), dtype=torch.float32)
             pred_count_soft = None
 
-        gt_boxes = extract_gt_boxes_from_example(
+        gt_boxes_detr = extract_gt_boxes_from_example(
             ex,
             width=w,
             height=h,
@@ -574,10 +590,24 @@ def main() -> None:
             coord_order=effective_order,
             box_supervision_source=effective_source,
         )
-        gt_xyxy = cxcywh_to_xyxy_abs(gt_boxes, width=w, height=h)
+        gt_xyxy_detr = cxcywh_to_xyxy_abs(gt_boxes_detr, width=w, height=h)
+        if effective_lm_source == effective_source:
+            gt_boxes_lm = gt_boxes_detr
+            gt_xyxy_lm = gt_xyxy_detr
+        else:
+            gt_boxes_lm = extract_gt_boxes_from_example(
+                ex,
+                width=w,
+                height=h,
+                assistant_text=assistant_text,
+                coord_mode=effective_mode,
+                coord_order=effective_order,
+                box_supervision_source=effective_lm_source,
+            )
+            gt_xyxy_lm = cxcywh_to_xyxy_abs(gt_boxes_lm, width=w, height=h)
 
         if det_active:
-            precision, recall, f1 = detection_prf(pred_xyxy, gt_xyxy, iou_thr=args.iou_threshold)
+            precision, recall, f1 = detection_prf(pred_xyxy, gt_xyxy_detr, iou_thr=args.iou_threshold)
         else:
             precision, recall, f1 = None, None, None
         lm_pred_count_text: int | None = None
@@ -625,29 +655,34 @@ def main() -> None:
             )
             lm_xyxy = cxcywh_to_xyxy_abs(lm_boxes, width=w, height=h)
             lm_pred_count_boxes = int(lm_boxes.shape[0])
-            lm_abs_error_boxes = abs(lm_pred_count_boxes - int(gt_boxes.shape[0]))
-            lm_precision, lm_recall, lm_f1 = detection_prf(lm_xyxy, gt_xyxy, iou_thr=args.iou_threshold)
+            lm_abs_error_boxes = abs(lm_pred_count_boxes - int(gt_boxes_lm.shape[0]))
+            lm_precision, lm_recall, lm_f1 = detection_prf(lm_xyxy, gt_xyxy_lm, iou_thr=args.iou_threshold)
             if lm_pred_count_text is not None:
-                lm_abs_error_text = abs(int(lm_pred_count_text) - int(gt_boxes.shape[0]))
+                lm_abs_error_text = abs(int(lm_pred_count_text) - int(gt_boxes_lm.shape[0]))
             if len(lm_text_preview) < 20:
                 lm_text_preview.append(
                     {
                         "index": idx,
-                        "gt_count": int(gt_boxes.shape[0]),
+                        "gt_count": int(gt_boxes_lm.shape[0]),
+                        "gt_count_detr": int(gt_boxes_detr.shape[0]),
+                        "gt_count_lm": int(gt_boxes_lm.shape[0]),
                         "lm_count_text": lm_pred_count_text,
                         "lm_count_boxes": lm_pred_count_boxes,
                         "text": lm_text,
                     }
                 )
 
-        gt_count = int(gt_boxes.shape[0])
+        gt_count = int(gt_boxes_lm.shape[0])
+        gt_count_detr = int(gt_boxes_detr.shape[0])
         pred_count = (int(pred_boxes.shape[0]) if det_active else None)
         row = EvalRow(
             index=idx,
             gt_count=gt_count,
+            gt_count_detr=gt_count_detr,
+            gt_count_lm=gt_count,
             pred_count_detr=pred_count,
             pred_count_soft_detr=pred_count_soft,
-            abs_error_detr=(abs(int(pred_count) - gt_count) if pred_count is not None else None),
+            abs_error_detr=(abs(int(pred_count) - gt_count_detr) if pred_count is not None else None),
             precision_detr=precision,
             recall_detr=recall,
             f1_detr=f1,
@@ -669,7 +704,7 @@ def main() -> None:
 
         if args.save_overlays and ((idx - start) % max(args.overlay_every, 1) == 0):
             vis = img.copy()
-            draw_boxes(vis, gt_xyxy, color="lime", width=3)
+            draw_boxes(vis, gt_xyxy_lm, color="lime", width=3)
             if det_active:
                 draw_boxes(vis, pred_xyxy, color="red", width=2)
             if args.eval_lm_generation:
@@ -733,9 +768,11 @@ def main() -> None:
         "box_coord_mode": args.box_coord_mode,
         "box_coord_order": args.box_coord_order,
         "box_supervision_source": args.box_supervision_source,
+        "lm_box_supervision_source": args.lm_box_supervision_source,
         "box_coord_mode_used": effective_mode,
         "box_coord_order_used": effective_order,
         "box_supervision_source_used": effective_source,
+        "lm_box_supervision_source_used": effective_lm_source,
         "lm_box_parse_mode_used": effective_lm_parse_mode,
         "lm_box_parse_order_used": effective_lm_parse_order,
         "bucket_thresholds": {

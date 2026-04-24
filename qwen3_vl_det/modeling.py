@@ -67,6 +67,7 @@ class AuxDetrBranchConfig:
     instance_token_id: Optional[int] = None
     instance_lm_num_tokens: int = 32
     detach_instance_tokens_for_lm: bool = False
+    allow_lm_fusion_fallback: bool = True
     inject_dino_tokens_to_lm: bool = False
     dino_lm_token_id: Optional[int] = None
     dino_lm_num_tokens: int = 16
@@ -1141,6 +1142,8 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
         try:
             return self.base_model(**fused_inputs)
         except Exception as exc:
+            if not bool(self.branch_cfg.allow_lm_fusion_fallback):
+                raise
             fused_inputs.pop("pixel_values", None)
             fused_inputs.pop("image_grid_thw", None)
             fused_inputs.pop("mm_token_type_ids", None)
@@ -1317,6 +1320,8 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
                         result["lm_loss"] = lm_loss
                     del fused_outputs
                 except Exception as exc:
+                    if not bool(self.branch_cfg.allow_lm_fusion_fallback):
+                        raise
                     if not self._warned_lm_fusion_fail:
                         print(
                             "WARNING: fused-visual-to-LM second pass failed; "
@@ -1355,6 +1360,8 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
                         result["lm_loss"] = lm_loss
                     del fused_outputs
                 except Exception as exc:
+                    if not bool(self.branch_cfg.allow_lm_fusion_fallback):
+                        raise
                     if not self._warned_lm_fusion_fail:
                         print(
                             "WARNING: instance-token-to-LM fusion second pass failed; "
@@ -1391,6 +1398,8 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
                         result["lm_loss"] = lm_loss
                     del fused_outputs
                 except Exception as exc:
+                    if not bool(self.branch_cfg.allow_lm_fusion_fallback):
+                        raise
                     if not self._warned_lm_fusion_fail:
                         print(
                             "WARNING: DETR-to-LM fusion second pass failed; "
@@ -1462,6 +1471,8 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
                 try:
                     return self.base_model.generate(**gen_inputs, **generate_kwargs)
                 except Exception as exc:
+                    if not bool(self.branch_cfg.allow_lm_fusion_fallback):
+                        raise
                     if not self._warned_lm_fusion_fail:
                         print(
                             "WARNING: DINO direct-fusion generate with pixel inputs failed; "
@@ -1509,6 +1520,8 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
                 try:
                     return self.base_model.generate(**gen_inputs, **generate_kwargs)
                 except Exception as exc:
+                    if not bool(self.branch_cfg.allow_lm_fusion_fallback):
+                        raise
                     if not self._warned_lm_fusion_fail:
                         print(
                             "WARNING: fused-visual generate with pixel inputs failed; "
@@ -1592,6 +1605,8 @@ class Qwen3VLAuxDetrAdapter(nn.Module):
         try:
             return self.base_model.generate(**gen_inputs, **generate_kwargs)
         except Exception as exc:
+            if not bool(self.branch_cfg.allow_lm_fusion_fallback):
+                raise
             if not self._warned_lm_fusion_fail:
                 print(
                     f"WARNING: {warn_label} generate with pixel inputs failed; "

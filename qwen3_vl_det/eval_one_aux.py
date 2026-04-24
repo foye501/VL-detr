@@ -57,6 +57,12 @@ def parse_args() -> argparse.Namespace:
         choices=list(BOX_SUPERVISION_CHOICES),
         default="all",
     )
+    p.add_argument(
+        "--lm-box-supervision-source",
+        choices=["auto"] + list(BOX_SUPERVISION_CHOICES),
+        default="auto",
+        help="GT source for LM text/box metrics and task GT visualization. auto uses checkpoint lm_box_source when available.",
+    )
     p.add_argument("--model-name", default="")
     p.add_argument("--hf-token", default="")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -384,6 +390,7 @@ def main() -> None:
     if is_local_ckpt and os.path.exists(train_args_path):
         with open(train_args_path, "r", encoding="utf-8") as f:
             train_args = json.load(f)
+    ckpt_lm_source = str(train_args.get("lm_box_source", "")).lower()
     ckpt_lm_mode = str(train_args.get("lm_box_output_mode", "")).lower()
     ckpt_lm_order = str(train_args.get("lm_box_output_order", "")).lower()
     ckpt_lm_target_mode = str(train_args.get("lm_target_mode", "")).lower()
@@ -654,9 +661,12 @@ def main() -> None:
         effective_order = ckpt_order
     if args.box_supervision_source == "all" and ckpt_source in BOX_SUPERVISION_CHOICES:
         effective_source = ckpt_source
+    effective_lm_source = args.lm_box_supervision_source
+    if effective_lm_source == "auto":
+        effective_lm_source = ckpt_lm_source if ckpt_lm_source in BOX_SUPERVISION_CHOICES else effective_source
     used_mode = inferred_mode if effective_mode == "auto" else effective_mode
     used_order = inferred_order if effective_order == "auto" else effective_order
-    gt_boxes = extract_gt_boxes_from_example(
+    gt_boxes_detr = extract_gt_boxes_from_example(
         ex,
         width=w,
         height=h,
@@ -665,8 +675,23 @@ def main() -> None:
         coord_order=effective_order,
         box_supervision_source=effective_source,
     )
-    gt_xyxy = cxcywh_to_xyxy_abs(gt_boxes, width=w, height=h)
-    gt_raw_field, gt_raw_boxes = _raw_gt_box_source(ex, effective_source)
+    gt_xyxy_detr = cxcywh_to_xyxy_abs(gt_boxes_detr, width=w, height=h)
+    if effective_lm_source == effective_source:
+        gt_boxes = gt_boxes_detr
+        gt_xyxy = gt_xyxy_detr
+    else:
+        gt_boxes = extract_gt_boxes_from_example(
+            ex,
+            width=w,
+            height=h,
+            assistant_text=assistant_text,
+            coord_mode=effective_mode,
+            coord_order=effective_order,
+            box_supervision_source=effective_lm_source,
+        )
+        gt_xyxy = cxcywh_to_xyxy_abs(gt_boxes, width=w, height=h)
+    gt_raw_field, gt_raw_boxes = _raw_gt_box_source(ex, effective_lm_source)
+    gt_raw_field_detr, gt_raw_boxes_detr = _raw_gt_box_source(ex, effective_source)
     gt_labels = _indexed_labels("g", int(gt_xyxy.shape[0]))
     lm_labels = _indexed_labels("p", int(lm_xyxy.shape[0]))
 
@@ -748,6 +773,15 @@ def main() -> None:
                 "xyxy_abs": [_round4(v) for v in gt_xyxy[i].tolist()],
             }
         )
+    gt_detr_items = []
+    for i in range(int(gt_boxes_detr.shape[0])):
+        gt_detr_items.append(
+            {
+                "rank": i,
+                "cxcywh_norm": [_round4(v) for v in gt_boxes_detr[i].tolist()],
+                "xyxy_abs": [_round4(v) for v in gt_xyxy_detr[i].tolist()],
+            }
+        )
 
     out_json = args.output_json.strip()
     if not out_json:
@@ -765,6 +799,8 @@ def main() -> None:
         "threshold": float(args.obj_threshold),
         "counts": {
             "gt_count": int(gt_boxes.shape[0]),
+            "gt_count_lm": int(gt_boxes.shape[0]),
+            "gt_count_detr": int(gt_boxes_detr.shape[0]),
             "pred_count_thresholded_detr": (int(pred_boxes.shape[0]) if det_active and obj_prob.numel() > 0 else None),
             "pred_soft_count_detr": (_round4(soft_count) if det_active and soft_count is not None else None),
             "pred_count_lm_text": int(lm_count_text) if lm_count_text is not None else None,
@@ -774,6 +810,11 @@ def main() -> None:
         "gt_boxes_raw_source": {
             "field": gt_raw_field,
             "values": gt_raw_boxes,
+        },
+        "gt_boxes_detr": gt_detr_items,
+        "gt_boxes_detr_raw_source": {
+            "field": gt_raw_field_detr,
+            "values": gt_raw_boxes_detr,
         },
         "pred_boxes_thresholded_detr": pred_items,
         "pred_topk_queries_detr": top_items,
@@ -802,6 +843,7 @@ def main() -> None:
             "box_coord_mode_used": used_mode,
             "box_coord_order_used": used_order,
             "box_supervision_source_used": effective_source,
+            "lm_box_supervision_source_used": effective_lm_source,
         },
     }
     with open(out_json, "w", encoding="utf-8") as f:
@@ -815,6 +857,8 @@ def main() -> None:
     print(f"Saved 4-panel compare: {compare4_image_path}")
     print(f"Saved prediction json: {out_json}")
     print(f"GT count: {gt_boxes.shape[0]}")
+    if effective_source != effective_lm_source:
+        print(f"GT count DETR source: {gt_boxes_detr.shape[0]}")
     if det_active and obj_prob.numel() > 0:
         print(f"Pred count DETR (@{args.obj_threshold:.2f}): {pred_boxes.shape[0]}")
         print(f"Pred soft count DETR (sum probs): {soft_count:.2f}")
@@ -838,8 +882,12 @@ def main() -> None:
         f"inferred={inferred_order}, used={used_order}"
     )
     print(
-        f"Box supervision source: requested={args.box_supervision_source}, "
+        f"DETR box supervision source: requested={args.box_supervision_source}, "
         f"checkpoint={ckpt_source or 'n/a'}, used={effective_source}"
+    )
+    print(
+        f"LM GT box supervision source: requested={args.lm_box_supervision_source}, "
+        f"checkpoint_lm={ckpt_lm_source or 'n/a'}, used={effective_lm_source}"
     )
     if gt_boxes.numel() > 0:
         print(
@@ -860,6 +908,15 @@ def main() -> None:
                 else None
             )
             print(f"  g{i+1}: raw={raw} -> xyxy_abs={xyxy}")
+    if effective_source != effective_lm_source and gt_raw_field_detr:
+        print(f"DETR GT raw boxes source: {gt_raw_field_detr}")
+        for i, raw in enumerate(gt_raw_boxes_detr[:20]):
+            xyxy = (
+                [_round4(v) for v in gt_xyxy_detr[i].tolist()]
+                if i < int(gt_xyxy_detr.shape[0])
+                else None
+            )
+            print(f"  d{i+1}: raw={raw} -> xyxy_abs={xyxy}")
     if det_active and pred_boxes.numel() > 0:
         print(
             "Pred box stats (norm cxcywh):",

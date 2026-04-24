@@ -91,6 +91,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--image-size", type=int, default=512)
     p.add_argument("--seed", type=int, default=7)
     p.add_argument("--export-images", action="store_true")
+    p.add_argument(
+        "--distractor-policy",
+        choices=["shape_only", "mixed", "language_hard"],
+        default="shape_only",
+        help=(
+            "shape_only preserves the original generator. mixed adds some same-shape or same-color "
+            "distractors. language_hard makes most distractors share either the target shape or target color."
+        ),
+    )
     return p.parse_args()
 
 
@@ -203,12 +212,42 @@ def build_question(target_shape: str, target_color_name: str, num_distractors: i
     return tpl.format(color=target_color_name, shape=target_shape)
 
 
+def sample_distractor_spec(
+    target_shape: str,
+    target_color_rgb: tuple[int, int, int],
+    policy: str,
+) -> tuple[str, tuple[int, int, int]]:
+    other_shapes = [s for s in SHAPES if s != target_shape]
+    other_colors = [c for _, c in TARGET_COLORS if c != target_color_rgb]
+    if not other_shapes or not other_colors:
+        return random.choice(SHAPES), random.choice(DISTRACTOR_COLORS)
+
+    if policy == "shape_only":
+        return random.choice(other_shapes), random.choice(DISTRACTOR_COLORS)
+
+    if policy == "language_hard":
+        r = random.random()
+        if r < 0.45:
+            return target_shape, random.choice(other_colors)
+        if r < 0.90:
+            return random.choice(other_shapes), target_color_rgb
+        return random.choice(other_shapes), random.choice(other_colors)
+
+    r = random.random()
+    if r < 0.33:
+        return target_shape, random.choice(other_colors)
+    if r < 0.66:
+        return random.choice(other_shapes), target_color_rgb
+    return random.choice(other_shapes), random.choice(other_colors)
+
+
 def generate_one(
     difficulty: str,
     sample_index: int,
     image_size: int,
     export_images: bool,
     image_dir: str,
+    distractor_policy: str,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     params = DIFFICULTY_LEVELS[difficulty]
     target_count = random.randint(*params["count_range"])
@@ -224,10 +263,12 @@ def generate_one(
     distractor_specs: list[tuple[str, tuple[int, int, int]]] = []
     if params["max_distractors"] > 0:
         num_distractors = random.randint(0, min(params["max_distractors"], target_count * 2))
-        available_shapes = [s for s in SHAPES if s != target_shape]
         for _ in range(num_distractors):
-            d_shape = random.choice(available_shapes)
-            d_color = random.choice(DISTRACTOR_COLORS)
+            d_shape, d_color = sample_distractor_spec(
+                target_shape=target_shape,
+                target_color_rgb=target_color_rgb,
+                policy=distractor_policy,
+            )
             distractor_specs.append((d_shape, d_color))
 
     planned = [(target_shape, target_color_rgb, True)] * target_count
@@ -369,6 +410,7 @@ def main() -> None:
                 image_size=args.image_size,
                 export_images=args.export_images,
                 image_dir=image_dir,
+                distractor_policy=args.distractor_policy,
             )
             rows.append(row)
             eval_rows.append(eval_row)

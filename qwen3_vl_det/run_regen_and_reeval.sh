@@ -7,6 +7,7 @@ SAMPLES_PER_LEVEL="${SAMPLES_PER_LEVEL:-50}"
 IMAGE_SIZE="${IMAGE_SIZE:-512}"
 SEED="${SEED:-17}"
 EXPORT_IMAGES="${EXPORT_IMAGES:-1}"
+DISTRACTOR_POLICY="${DISTRACTOR_POLICY:-language_hard}"
 
 LORA_DIR="${LORA_DIR:-qwen3_vl_det/checkpoints_lora_boxcount_baseline_v2}"
 DINO_DIR="${DINO_DIR:-qwen3_vl_det/checkpoints_dino_fused_visual_boxcount_v2_t64}"
@@ -34,6 +35,7 @@ gen_cmd=(
   --samples-per-level "${SAMPLES_PER_LEVEL}"
   --image-size "${IMAGE_SIZE}"
   --seed "${SEED}"
+  --distractor-policy "${DISTRACTOR_POLICY}"
 )
 if [[ "${EXPORT_IMAGES}" == "1" ]]; then
   gen_cmd+=(--export-images)
@@ -50,6 +52,7 @@ eval_common=(
   --box-coord-mode norm1000
   --box-coord-order yxyx
   --box-supervision-source target
+  --lm-box-supervision-source target
   --lm-max-new-tokens "${LM_MAX_NEW_TOKENS}"
 )
 if [[ "${REQUIRE_VISION}" == "1" ]]; then

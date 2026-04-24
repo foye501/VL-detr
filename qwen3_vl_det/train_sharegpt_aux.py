@@ -110,6 +110,7 @@ class TrainAuxArgs:
     inject_instance_tokens_to_lm: bool = False
     instance_lm_num_tokens: int = 32
     detach_instance_tokens_for_lm: bool = False
+    strict_lm_fusion: bool = False
     use_dino_fusion: bool = False
     dino_model_name: str = "facebook/dinov2-base"
     dino_trainable: bool = False
@@ -233,6 +234,7 @@ def parse_args() -> TrainAuxArgs:
     p.add_argument("--inject-instance-tokens-to-lm", action="store_true")
     p.add_argument("--instance-lm-num-tokens", type=int, default=TrainAuxArgs.instance_lm_num_tokens)
     p.add_argument("--detach-instance-tokens-for-lm", action="store_true")
+    p.add_argument("--strict-lm-fusion", action="store_true")
     p.add_argument("--use-dino-fusion", action="store_true")
     p.add_argument("--dino-model-name", default=TrainAuxArgs.dino_model_name)
     p.add_argument("--dino-trainable", action="store_true")
@@ -959,6 +961,7 @@ def main() -> None:
         instance_token_id=instance_lm_token_id,
         instance_lm_num_tokens=int(args.instance_lm_num_tokens),
         detach_instance_tokens_for_lm=bool(args.detach_instance_tokens_for_lm),
+        allow_lm_fusion_fallback=not bool(args.strict_lm_fusion),
         use_dino_fusion=bool(args.use_dino_fusion),
         dino_model_name=str(args.dino_model_name),
         dino_trainable=bool(args.dino_trainable),
@@ -1016,7 +1019,7 @@ def main() -> None:
                 "INFO: resumed adapter state loaded with "
                 f"missing={len(missing)} unexpected={len(unexpected)}"
             )
-    if added_det_query_tokens > 0 or added_dino_patch_tokens > 0:
+    if added_det_query_tokens > 0 or added_dino_patch_tokens > 0 or added_instance_tokens > 0:
         model.base_model.resize_token_embeddings(len(tokenizer))
         print(f"Resized token embeddings to {len(tokenizer)}")
     model.hungarian_cfg = HungarianLossConfig(

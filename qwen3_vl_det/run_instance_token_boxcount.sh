@@ -32,7 +32,7 @@ BOX_ORDER="${BOX_ORDER:-yxyx}"
 LM_BOX_OUTPUT_MODE="${LM_BOX_OUTPUT_MODE:-norm1000}"
 LM_BOX_OUTPUT_ORDER="${LM_BOX_OUTPUT_ORDER:-yxyx}"
 LM_BOX_SOURCE="${LM_BOX_SOURCE:-target}"
-DETR_BOX_SOURCE="${DETR_BOX_SOURCE:-target}"
+DETR_BOX_SOURCE="${DETR_BOX_SOURCE:-all}"
 OBJ_THRESHOLD="${OBJ_THRESHOLD:-0.15}"
 IOU_THRESHOLD="${IOU_THRESHOLD:-0.5}"
 START_INDEX="${START_INDEX:-3000}"
@@ -44,6 +44,7 @@ USE_LORA="${USE_LORA:-1}"
 ENABLE_VISION_LORA="${ENABLE_VISION_LORA:-1}"
 FREEZE_VISION_BACKBONE="${FREEZE_VISION_BACKBONE:-0}"
 STRICT_VISION_MEMORY="${STRICT_VISION_MEMORY:-1}"
+STRICT_LM_FUSION="${STRICT_LM_FUSION:-1}"
 ASSISTANT_ONLY_LOSS="${ASSISTANT_ONLY_LOSS:-1}"
 MERGE_LORA_ON_SAVE="${MERGE_LORA_ON_SAVE:-1}"
 
@@ -120,6 +121,9 @@ if [[ "${STRICT_VISION_MEMORY}" == "1" ]]; then
 else
   train_cmd+=(--allow-token-fallback-memory)
 fi
+if [[ "${STRICT_LM_FUSION}" == "1" ]]; then
+  train_cmd+=(--strict-lm-fusion)
+fi
 if [[ "${ASSISTANT_ONLY_LOSS}" == "1" ]]; then
   train_cmd+=(--assistant-only-loss)
 else
@@ -157,6 +161,7 @@ eval_cmd=(
   --box-coord-mode "${BOX_MODE}"
   --box-coord-order "${BOX_ORDER}"
   --box-supervision-source "${DETR_BOX_SOURCE}"
+  --lm-box-supervision-source "${LM_BOX_SOURCE}"
   --lm-max-new-tokens "${LM_MAX_NEW_TOKENS}"
   --require-vision
   --output-json "${eval_json}"
@@ -179,6 +184,8 @@ one_cmd=(
   --obj-threshold "${OBJ_THRESHOLD}"
   --box-coord-mode "${BOX_MODE}"
   --box-coord-order "${BOX_ORDER}"
+  --box-supervision-source "${DETR_BOX_SOURCE}"
+  --lm-box-supervision-source "${LM_BOX_SOURCE}"
   --require-vision
   --lm-max-new-tokens "${LM_MAX_NEW_TOKENS}"
   --output-image "${OUTPUT_DIR}/eval_one_${SAMPLE_INDEX}.png"

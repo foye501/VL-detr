@@ -8,6 +8,16 @@ IMAGE_SIZE="${IMAGE_SIZE:-512}"
 SEED="${SEED:-17}"
 EXPORT_IMAGES="${EXPORT_IMAGES:-1}"
 DISTRACTOR_POLICY="${DISTRACTOR_POLICY:-language_hard}"
+ZERO_COUNT_PROB="${ZERO_COUNT_PROB:-0.10}"
+MIN_DISTRACTORS="${MIN_DISTRACTORS:-2}"
+GUARANTEE_LANGUAGE_DISTRACTORS="${GUARANTEE_LANGUAGE_DISTRACTORS:-1}"
+BACKGROUND_STYLE="${BACKGROUND_STYLE:-mixed}"
+VISUAL_STYLE="${VISUAL_STYLE:-varied}"
+ROTATION_MAX_DEG="${ROTATION_MAX_DEG:-25}"
+COLOR_JITTER="${COLOR_JITTER:-12}"
+OCCLUSION_PROB="${OCCLUSION_PROB:-0.10}"
+NOISE_PROB="${NOISE_PROB:-0.10}"
+BLUR_PROB="${BLUR_PROB:-0.05}"
 
 LORA_DIR="${LORA_DIR:-qwen3_vl_det/checkpoints_lora_boxcount_baseline_v2}"
 DINO_DIR="${DINO_DIR:-qwen3_vl_det/checkpoints_dino_fused_visual_boxcount_v2_t64}"
@@ -36,7 +46,19 @@ gen_cmd=(
   --image-size "${IMAGE_SIZE}"
   --seed "${SEED}"
   --distractor-policy "${DISTRACTOR_POLICY}"
+  --zero-count-prob "${ZERO_COUNT_PROB}"
+  --min-distractors "${MIN_DISTRACTORS}"
+  --background-style "${BACKGROUND_STYLE}"
+  --visual-style "${VISUAL_STYLE}"
+  --rotation-max-deg "${ROTATION_MAX_DEG}"
+  --color-jitter "${COLOR_JITTER}"
+  --occlusion-prob "${OCCLUSION_PROB}"
+  --noise-prob "${NOISE_PROB}"
+  --blur-prob "${BLUR_PROB}"
 )
+if [[ "${GUARANTEE_LANGUAGE_DISTRACTORS}" == "1" ]]; then
+  gen_cmd+=(--guarantee-language-distractors)
+fi
 if [[ "${EXPORT_IMAGES}" == "1" ]]; then
   gen_cmd+=(--export-images)
 fi
